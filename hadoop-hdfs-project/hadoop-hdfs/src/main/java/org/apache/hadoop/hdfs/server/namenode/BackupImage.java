@@ -24,6 +24,7 @@ import java.util.List;
 
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;
 import org.apache.hadoop.hdfs.server.common.InconsistentFSStateException;
 import org.apache.hadoop.hdfs.server.common.Storage.StorageDirectory;
@@ -82,6 +83,8 @@ public class BackupImage extends FSImage {
   
   private FSNamesystem namesystem;
 
+  private int quotaInitThreads;
+
   /**
    * Construct a backup image.
    * @param conf Configuration
@@ -91,10 +94,20 @@ public class BackupImage extends FSImage {
     super(conf);
     storage.setDisablePreUpgradableLayoutCheck(true);
     bnState = BNState.DROP_UNTIL_NEXT_ROLL;
+    quotaInitThreads = conf.getInt(
+        DFSConfigKeys.DFS_NAMENODE_QUOTA_INIT_THREADS_KEY,
+        DFSConfigKeys.DFS_NAMENODE_QUOTA_INIT_THREADS_DEFAULT);
   }
-  
-  void setNamesystem(FSNamesystem fsn) {
-    this.namesystem = fsn;
+
+  synchronized FSNamesystem getNamesystem() {
+    return namesystem;
+  }
+
+  synchronized void setNamesystem(FSNamesystem fsn) {
+    // Avoids overriding this.namesystem object
+    if (namesystem == null) {
+      this.namesystem = fsn;
+    }
   }
 
   /**
@@ -137,14 +150,6 @@ public class BackupImage extends FSImage {
         throw ioe;
       }
     }
-  }
-
-  /**
-   * Save meta-data into fsimage files.
-   * and create empty edits.
-   */
-  void saveCheckpoint() throws IOException {
-    saveNamespace(namesystem);
   }
 
   /**
@@ -203,7 +208,7 @@ public class BackupImage extends FSImage {
       }
 
       FSEditLogLoader logLoader =
-          new FSEditLogLoader(namesystem, lastAppliedTxId);
+          new FSEditLogLoader(getNamesystem(), lastAppliedTxId);
       int logVersion = storage.getLayoutVersion();
       backupInputStream.setBytes(data, logVersion);
 
@@ -217,7 +222,9 @@ public class BackupImage extends FSImage {
       }
       lastAppliedTxId = logLoader.getLastAppliedTxId();
 
-      FSImage.updateCountForQuota(namesystem.dir.rootDir); // inefficient!
+      FSImage.updateCountForQuota(
+          getNamesystem().dir.getBlockStoragePolicySuite(),
+          getNamesystem().dir.rootDir, quotaInitThreads);
     } finally {
       backupInputStream.clear();
     }
@@ -266,7 +273,7 @@ public class BackupImage extends FSImage {
           editStreams.add(s);
         }
       }
-      loadEdits(editStreams, namesystem);
+      loadEdits(editStreams, getNamesystem());
     }
     
     // now, need to load the in-progress file
@@ -301,7 +308,7 @@ public class BackupImage extends FSImage {
             + " txns from in-progress stream " + stream);
         
         FSEditLogLoader loader =
-            new FSEditLogLoader(namesystem, lastAppliedTxId);
+            new FSEditLogLoader(getNamesystem(), lastAppliedTxId);
         loader.loadFSEdits(stream, lastAppliedTxId + 1);
         lastAppliedTxId = loader.getLastAppliedTxId();
         assert lastAppliedTxId == getEditLog().getLastWrittenTxId();
@@ -332,7 +339,7 @@ public class BackupImage extends FSImage {
    * directories.
    */
   synchronized void namenodeStartedLogSegment(long txid) throws IOException {
-    editLog.startLogSegment(txid, true);
+    editLog.startLogSegment(txid, true, namesystem.getEffectiveLayoutVersion());
 
     if (bnState == BNState.DROP_UNTIL_NEXT_ROLL) {
       setState(BNState.JOURNAL_ONLY);

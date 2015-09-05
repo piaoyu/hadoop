@@ -27,9 +27,11 @@ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_BLOCKREPORT_SPLIT_THRESHO
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_BLOCKREPORT_SPLIT_THRESHOLD_DEFAULT;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_CACHEREPORT_INTERVAL_MSEC_DEFAULT;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_CACHEREPORT_INTERVAL_MSEC_KEY;
-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_CLIENT_SOCKET_TIMEOUT_KEY;
-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_CLIENT_WRITE_PACKET_SIZE_DEFAULT;
-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_CLIENT_WRITE_PACKET_SIZE_KEY;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DATANODE_NON_LOCAL_LAZY_PERSIST;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DATANODE_NON_LOCAL_LAZY_PERSIST_DEFAULT;
+import static org.apache.hadoop.hdfs.client.HdfsClientConfigKeys.DFS_CLIENT_SOCKET_TIMEOUT_KEY;
+import static org.apache.hadoop.hdfs.client.HdfsClientConfigKeys.DFS_CLIENT_WRITE_PACKET_SIZE_DEFAULT;
+import static org.apache.hadoop.hdfs.client.HdfsClientConfigKeys.DFS_CLIENT_WRITE_PACKET_SIZE_KEY;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DATANODE_MAX_LOCKED_MEMORY_DEFAULT;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DATANODE_MAX_LOCKED_MEMORY_KEY;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DATANODE_SOCKET_WRITE_TIMEOUT_KEY;
@@ -53,9 +55,10 @@ import static org.apache.hadoop.hdfs.DFSConfigKeys.IGNORE_SECURE_PORTS_FOR_TESTI
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
+import org.apache.hadoop.hdfs.client.HdfsClientConfigKeys;
+import org.apache.hadoop.hdfs.protocol.HdfsConstants;
 import org.apache.hadoop.hdfs.protocol.datatransfer.TrustedChannelResolver;
 import org.apache.hadoop.hdfs.protocol.datatransfer.sasl.DataTransferSaslUtil;
-import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;
 import org.apache.hadoop.security.SaslPropertiesResolver;
 
 /**
@@ -64,6 +67,7 @@ import org.apache.hadoop.security.SaslPropertiesResolver;
  */
 @InterfaceAudience.Private
 public class DNConf {
+  final Configuration conf;
   final int socketTimeout;
   final int socketWriteTimeout;
   final int socketKeepaliveTimeout;
@@ -81,8 +85,7 @@ public class DNConf {
   final long heartBeatInterval;
   final long blockReportInterval;
   final long blockReportSplitThreshold;
-  final long deleteReportInterval;
-  final long initialBlockReportDelay;
+  final long initialBlockReportDelayMs;
   final long cacheReportInterval;
   final long dfsclientSlowIoWarningThresholdMs;
   final long datanodeSlowIoWarningThresholdMs;
@@ -99,11 +102,15 @@ public class DNConf {
 
   final long maxLockedMemory;
 
+  // Allow LAZY_PERSIST writes from non-local clients?
+  private final boolean allowNonLocalLazyPersist;
+
   public DNConf(Configuration conf) {
+    this.conf = conf;
     socketTimeout = conf.getInt(DFS_CLIENT_SOCKET_TIMEOUT_KEY,
-        HdfsServerConstants.READ_TIMEOUT);
+        HdfsConstants.READ_TIMEOUT);
     socketWriteTimeout = conf.getInt(DFS_DATANODE_SOCKET_WRITE_TIMEOUT_KEY,
-        HdfsServerConstants.WRITE_TIMEOUT);
+        HdfsConstants.WRITE_TIMEOUT);
     socketKeepaliveTimeout = conf.getInt(
         DFSConfigKeys.DFS_DATANODE_SOCKET_REUSE_KEEPALIVE_KEY,
         DFSConfigKeys.DFS_DATANODE_SOCKET_REUSE_KEEPALIVE_DEFAULT);
@@ -118,8 +125,8 @@ public class DNConf {
         DFS_CLIENT_WRITE_PACKET_SIZE_DEFAULT);
     
     readaheadLength = conf.getLong(
-        DFSConfigKeys.DFS_DATANODE_READAHEAD_BYTES_KEY,
-        DFSConfigKeys.DFS_DATANODE_READAHEAD_BYTES_DEFAULT);
+        HdfsClientConfigKeys.DFS_DATANODE_READAHEAD_BYTES_KEY,
+        HdfsClientConfigKeys.DFS_DATANODE_READAHEAD_BYTES_DEFAULT);
     dropCacheBehindWrites = conf.getBoolean(
         DFSConfigKeys.DFS_DATANODE_DROP_CACHE_BEHIND_WRITES_KEY,
         DFSConfigKeys.DFS_DATANODE_DROP_CACHE_BEHIND_WRITES_DEFAULT);
@@ -143,8 +150,8 @@ public class DNConf {
         DFS_CACHEREPORT_INTERVAL_MSEC_DEFAULT);
 
     this.dfsclientSlowIoWarningThresholdMs = conf.getLong(
-        DFSConfigKeys.DFS_CLIENT_SLOW_IO_WARNING_THRESHOLD_KEY,
-        DFSConfigKeys.DFS_CLIENT_SLOW_IO_WARNING_THRESHOLD_DEFAULT);
+        HdfsClientConfigKeys.DFS_CLIENT_SLOW_IO_WARNING_THRESHOLD_KEY,
+        HdfsClientConfigKeys.DFS_CLIENT_SLOW_IO_WARNING_THRESHOLD_DEFAULT);
     this.datanodeSlowIoWarningThresholdMs = conf.getLong(
         DFSConfigKeys.DFS_DATANODE_SLOW_IO_WARNING_THRESHOLD_KEY,
         DFSConfigKeys.DFS_DATANODE_SLOW_IO_WARNING_THRESHOLD_DEFAULT);
@@ -154,15 +161,15 @@ public class DNConf {
         DFS_BLOCKREPORT_INITIAL_DELAY_DEFAULT) * 1000L;
     if (initBRDelay >= blockReportInterval) {
       initBRDelay = 0;
-      DataNode.LOG.info("dfs.blockreport.initialDelay is greater than " +
-          "dfs.blockreport.intervalMsec." + " Setting initial delay to 0 msec:");
+      DataNode.LOG.info("dfs.blockreport.initialDelay is "
+          + "greater than or equal to" + "dfs.blockreport.intervalMsec."
+          + " Setting initial delay to 0 msec:");
     }
-    initialBlockReportDelay = initBRDelay;
+    initialBlockReportDelayMs = initBRDelay;
     
     heartBeatInterval = conf.getLong(DFS_HEARTBEAT_INTERVAL_KEY,
         DFS_HEARTBEAT_INTERVAL_DEFAULT) * 1000L;
     
-    this.deleteReportInterval = 100 * heartBeatInterval;
     // do we need to sync block file contents to disk when blockfile is closed?
     this.syncOnClose = conf.getBoolean(DFS_DATANODE_SYNCONCLOSE_KEY, 
         DFS_DATANODE_SYNCONCLOSE_DEFAULT);
@@ -191,11 +198,24 @@ public class DNConf {
     this.restartReplicaExpiry = conf.getLong(
         DFS_DATANODE_RESTART_REPLICA_EXPIRY_KEY,
         DFS_DATANODE_RESTART_REPLICA_EXPIRY_DEFAULT) * 1000L;
+
+    this.allowNonLocalLazyPersist = conf.getBoolean(
+        DFS_DATANODE_NON_LOCAL_LAZY_PERSIST,
+        DFS_DATANODE_NON_LOCAL_LAZY_PERSIST_DEFAULT);
   }
 
   // We get minimumNameNodeVersion via a method so it can be mocked out in tests.
   String getMinimumNameNodeVersion() {
     return this.minimumNameNodeVersion;
+  }
+  
+  /**
+   * Returns the configuration.
+   * 
+   * @return Configuration the configuration
+   */
+  public Configuration getConf() {
+    return conf;
   }
 
   /**
@@ -254,5 +274,9 @@ public class DNConf {
    */
   public boolean getIgnoreSecurePortsForTesting() {
     return ignoreSecurePortsForTesting;
+  }
+
+  public boolean getAllowNonLocalLazyPersist() {
+    return allowNonLocalLazyPersist;
   }
 }

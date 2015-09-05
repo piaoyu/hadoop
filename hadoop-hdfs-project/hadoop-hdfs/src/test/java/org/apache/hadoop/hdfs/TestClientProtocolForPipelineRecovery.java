@@ -23,18 +23,16 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hdfs.client.HdfsClientConfigKeys;
 import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
 import org.apache.hadoop.hdfs.server.datanode.DataNode;
 import org.apache.hadoop.hdfs.server.namenode.LeaseExpiredException;
 import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocols;
 import org.apache.hadoop.hdfs.tools.DFSAdmin;
-import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.io.IOUtils;
 import org.junit.Assert;
 import org.junit.Test;
-
 import org.mockito.Mockito;
-import org.mockito.stubbing.Answer;
 
 /**
  * This tests pipeline recovery related client protocol works correct or not.
@@ -130,7 +128,7 @@ public class TestClientProtocolForPipelineRecovery {
     DFSClientFaultInjector.instance = faultInjector;
     Configuration conf = new HdfsConfiguration();
 
-    conf.setInt(DFSConfigKeys.DFS_CLIENT_BLOCK_WRITE_LOCATEFOLLOWINGBLOCK_RETRIES_KEY, 3);
+    conf.setInt(HdfsClientConfigKeys.BlockWrite.LOCATEFOLLOWINGBLOCK_RETRIES_KEY, 3);
     MiniDFSCluster cluster = null;
 
     try {
@@ -147,7 +145,7 @@ public class TestClientProtocolForPipelineRecovery {
       // Read should succeed.
       FSDataInputStream in = fileSys.open(file);
       try {
-        int c = in.read();
+        in.read();
         // Test will fail with BlockMissingException if NN does not update the
         // replica state based on the latest report.
       } catch (org.apache.hadoop.hdfs.BlockMissingException bme) {
@@ -171,7 +169,7 @@ public class TestClientProtocolForPipelineRecovery {
   @Test
   public void testPipelineRecoveryOnOOB() throws Exception {
     Configuration conf = new HdfsConfiguration();
-    conf.set(DFSConfigKeys.DFS_CLIENT_DATANODE_RESTART_TIMEOUT_KEY, "15");
+    conf.set(HdfsClientConfigKeys.DFS_CLIENT_DATANODE_RESTART_TIMEOUT_KEY, "15");
     MiniDFSCluster cluster = null;
     try {
       int numDataNodes = 1;
@@ -209,7 +207,7 @@ public class TestClientProtocolForPipelineRecovery {
   @Test
   public void testPipelineRecoveryOnRestartFailure() throws Exception {
     Configuration conf = new HdfsConfiguration();
-    conf.set(DFSConfigKeys.DFS_CLIENT_DATANODE_RESTART_TIMEOUT_KEY, "5");
+    conf.set(HdfsClientConfigKeys.DFS_CLIENT_DATANODE_RESTART_TIMEOUT_KEY, "5");
     MiniDFSCluster cluster = null;
     try {
       int numDataNodes = 2;

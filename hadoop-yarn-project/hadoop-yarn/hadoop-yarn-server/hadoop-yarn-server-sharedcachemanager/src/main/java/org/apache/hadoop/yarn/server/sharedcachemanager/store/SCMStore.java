@@ -19,11 +19,21 @@
 package org.apache.hadoop.yarn.server.sharedcachemanager.store;
 
 import java.util.Collection;
+import java.util.HashSet;
+import java.util.Set;
 
 import org.apache.hadoop.classification.InterfaceAudience.Private;
 import org.apache.hadoop.classification.InterfaceStability.Evolving;
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.service.CompositeService;
+import org.apache.hadoop.util.ReflectionUtils;
+import org.apache.hadoop.yarn.conf.YarnConfiguration;
+import org.apache.hadoop.yarn.exceptions.YarnException;
+import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
+import org.apache.hadoop.yarn.server.sharedcachemanager.AppChecker;
+
+import com.google.common.annotations.VisibleForTesting;
 
 
 /**
@@ -35,8 +45,25 @@ import org.apache.hadoop.service.CompositeService;
 @Evolving
 public abstract class SCMStore extends CompositeService {
 
+  protected AppChecker appChecker;
+
   protected SCMStore(String name) {
     super(name);
+  }
+
+  @VisibleForTesting
+  SCMStore(String name, AppChecker appChecker) {
+    super(name);
+    this.appChecker = appChecker;
+  }
+
+  @Override
+  protected void serviceInit(Configuration conf) throws Exception {
+    if (this.appChecker == null) {
+      this.appChecker = createAppCheckerService(conf);
+    }
+    addService(appChecker);
+    super.serviceInit(conf);
   }
 
   /**
@@ -119,6 +146,33 @@ public abstract class SCMStore extends CompositeService {
       Collection<SharedCacheResourceReference> refs, boolean updateAccessTime);
 
   /**
+   * Clean all resource references to a cache resource that contain application
+   * ids pointing to finished applications. If the resource key does not exist,
+   * do nothing.
+   *
+   * @param key a unique identifier for a resource
+   * @throws YarnException
+   */
+  @Private
+  public void cleanResourceReferences(String key) throws YarnException {
+    Collection<SharedCacheResourceReference> refs = getResourceReferences(key);
+    if (!refs.isEmpty()) {
+      Set<SharedCacheResourceReference> refsToRemove =
+          new HashSet<SharedCacheResourceReference>();
+      for (SharedCacheResourceReference r : refs) {
+        if (!appChecker.isApplicationActive(r.getAppId())) {
+          // application in resource reference is dead, it is safe to remove the
+          // reference
+          refsToRemove.add(r);
+        }
+      }
+      if (refsToRemove.size() > 0) {
+        removeResourceReferences(key, refsToRemove, false);
+      }
+    }
+  }
+
+  /**
    * Check if a specific resource is evictable according to the store's enabled
    * cache eviction policies.
    * 
@@ -130,4 +184,30 @@ public abstract class SCMStore extends CompositeService {
   @Private
   public abstract boolean isResourceEvictable(String key, FileStatus file);
 
+  /**
+   * Create an instance of the AppChecker service via reflection based on the
+   * {@link YarnConfiguration#SCM_APP_CHECKER_CLASS} parameter.
+   * 
+   * @param conf
+   * @return an instance of the AppChecker class
+   */
+  @Private
+  @SuppressWarnings("unchecked")
+  public static AppChecker createAppCheckerService(Configuration conf) {
+    Class<? extends AppChecker> defaultCheckerClass;
+    try {
+      defaultCheckerClass =
+          (Class<? extends AppChecker>) Class
+              .forName(YarnConfiguration.DEFAULT_SCM_APP_CHECKER_CLASS);
+    } catch (Exception e) {
+      throw new YarnRuntimeException("Invalid default scm app checker class"
+          + YarnConfiguration.DEFAULT_SCM_APP_CHECKER_CLASS, e);
+    }
+
+    AppChecker checker =
+        ReflectionUtils.newInstance(conf.getClass(
+            YarnConfiguration.SCM_APP_CHECKER_CLASS, defaultCheckerClass,
+            AppChecker.class), conf);
+    return checker;
+  }
 }

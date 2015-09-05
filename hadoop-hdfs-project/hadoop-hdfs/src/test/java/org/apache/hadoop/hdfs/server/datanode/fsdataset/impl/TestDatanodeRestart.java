@@ -34,12 +34,14 @@ import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.DFSTestUtil;
 import org.apache.hadoop.hdfs.HdfsConfiguration;
 import org.apache.hadoop.hdfs.MiniDFSCluster;
+import org.apache.hadoop.hdfs.client.HdfsClientConfigKeys;
 import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.server.common.HdfsServerConstants.ReplicaState;
 import org.apache.hadoop.hdfs.server.datanode.DataNode;
 import org.apache.hadoop.hdfs.server.datanode.DataNodeTestUtils;
 import org.apache.hadoop.hdfs.server.datanode.DatanodeUtil;
 import org.apache.hadoop.hdfs.server.datanode.ReplicaInfo;
+import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsDatasetSpi;
 import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsVolumeSpi;
 import org.apache.hadoop.io.IOUtils;
 import org.junit.Assert;
@@ -52,7 +54,7 @@ public class TestDatanodeRestart {
     // bring up a cluster of 3
     Configuration conf = new HdfsConfiguration();
     conf.setLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY, 1024L);
-    conf.setInt(DFSConfigKeys.DFS_CLIENT_WRITE_PACKET_SIZE_KEY, 512);
+    conf.setInt(HdfsClientConfigKeys.DFS_CLIENT_WRITE_PACKET_SIZE_KEY, 512);
     MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).numDataNodes(3).build();
     cluster.waitActive();
     FileSystem fs = cluster.getFileSystem();
@@ -76,7 +78,7 @@ public class TestDatanodeRestart {
   public void testRbwReplicas() throws IOException {
     Configuration conf = new HdfsConfiguration();
     conf.setLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY, 1024L);
-    conf.setInt(DFSConfigKeys.DFS_CLIENT_WRITE_PACKET_SIZE_KEY, 512);
+    conf.setInt(HdfsClientConfigKeys.DFS_CLIENT_WRITE_PACKET_SIZE_KEY, 512);
     MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).numDataNodes(2).build();
     cluster.waitActive();
     try {
@@ -101,13 +103,18 @@ public class TestDatanodeRestart {
       out.write(writeBuf);
       out.hflush();
       DataNode dn = cluster.getDataNodes().get(0);
-      for (FsVolumeSpi v : dataset(dn).getVolumes()) {
-        final FsVolumeImpl volume = (FsVolumeImpl)v;
-        File currentDir = volume.getCurrentDir().getParentFile().getParentFile();
-        File rbwDir = new File(currentDir, "rbw");
-        for (File file : rbwDir.listFiles()) {
-          if (isCorrupt && Block.isBlockFilename(file)) {
-            new RandomAccessFile(file, "rw").setLength(fileLen-1); // corrupt
+      try (FsDatasetSpi.FsVolumeReferences volumes =
+          dataset(dn).getFsVolumeReferences()) {
+        for (FsVolumeSpi vol : volumes) {
+          final FsVolumeImpl volume = (FsVolumeImpl) vol;
+          File currentDir =
+              volume.getCurrentDir().getParentFile().getParentFile();
+          File rbwDir = new File(currentDir, "rbw");
+          for (File file : rbwDir.listFiles()) {
+            if (isCorrupt && Block.isBlockFilename(file)) {
+              new RandomAccessFile(file, "rw")
+                  .setLength(fileLen - 1); // corrupt
+            }
           }
         }
       }
@@ -140,7 +147,7 @@ public class TestDatanodeRestart {
   @Test public void testRecoverReplicas() throws Exception {
     Configuration conf = new HdfsConfiguration();
     conf.setLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY, 1024L);
-    conf.setInt(DFSConfigKeys.DFS_CLIENT_WRITE_PACKET_SIZE_KEY, 512);
+    conf.setInt(HdfsClientConfigKeys.DFS_CLIENT_WRITE_PACKET_SIZE_KEY, 512);
     MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).build();
     cluster.waitActive();
     try {

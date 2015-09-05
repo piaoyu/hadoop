@@ -18,12 +18,14 @@
 package org.apache.hadoop.hdfs.protocolPB;
 
 import java.io.IOException;
+import java.util.EnumSet;
 import java.util.List;
 
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.fs.BatchedRemoteIterator.BatchedEntries;
 import org.apache.hadoop.fs.ContentSummary;
+import org.apache.hadoop.fs.CreateFlag;
 import org.apache.hadoop.fs.FsServerDefaults;
 import org.apache.hadoop.fs.Options.Rename;
 import org.apache.hadoop.hdfs.protocol.BlockStoragePolicy;
@@ -34,7 +36,9 @@ import org.apache.hadoop.hdfs.protocol.ClientProtocol;
 import org.apache.hadoop.hdfs.protocol.CorruptFileBlocks;
 import org.apache.hadoop.hdfs.protocol.DirectoryListing;
 import org.apache.hadoop.hdfs.protocol.EncryptionZone;
+import org.apache.hadoop.hdfs.protocol.HdfsConstants;
 import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
+import org.apache.hadoop.hdfs.protocol.LastBlockWithStatus;
 import org.apache.hadoop.hdfs.protocol.LocatedBlock;
 import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
 import org.apache.hadoop.hdfs.protocol.RollingUpgradeInfo;
@@ -64,6 +68,8 @@ import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.AllowS
 import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.AllowSnapshotResponseProto;
 import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.AppendRequestProto;
 import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.AppendResponseProto;
+import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.CheckAccessRequestProto;
+import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.CheckAccessResponseProto;
 import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.CompleteRequestProto;
 import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.CompleteResponseProto;
 import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.ConcatRequestProto;
@@ -122,6 +128,8 @@ import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.GetSna
 import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.GetSnapshottableDirListingResponseProto;
 import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.GetStoragePoliciesRequestProto;
 import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.GetStoragePoliciesResponseProto;
+import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.GetStoragePolicyRequestProto;
+import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.GetStoragePolicyResponseProto;
 import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.IsFileClosedRequestProto;
 import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.IsFileClosedResponseProto;
 import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.ListCacheDirectivesRequestProto;
@@ -180,18 +188,19 @@ import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.SetSto
 import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.SetStoragePolicyResponseProto;
 import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.SetTimesRequestProto;
 import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.SetTimesResponseProto;
+import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.TruncateRequestProto;
+import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.TruncateResponseProto;
 import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.UpdateBlockForPipelineRequestProto;
 import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.UpdateBlockForPipelineResponseProto;
 import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.UpdatePipelineRequestProto;
 import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.UpdatePipelineResponseProto;
-import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.CheckAccessRequestProto;
-import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.CheckAccessResponseProto;
 import org.apache.hadoop.hdfs.protocol.proto.EncryptionZonesProtos.CreateEncryptionZoneResponseProto;
 import org.apache.hadoop.hdfs.protocol.proto.EncryptionZonesProtos.CreateEncryptionZoneRequestProto;
 import org.apache.hadoop.hdfs.protocol.proto.EncryptionZonesProtos.GetEZForPathResponseProto;
 import org.apache.hadoop.hdfs.protocol.proto.EncryptionZonesProtos.GetEZForPathRequestProto;
 import org.apache.hadoop.hdfs.protocol.proto.EncryptionZonesProtos.ListEncryptionZonesResponseProto;
 import org.apache.hadoop.hdfs.protocol.proto.EncryptionZonesProtos.ListEncryptionZonesRequestProto;
+import org.apache.hadoop.hdfs.protocol.proto.HdfsProtos.BlockStoragePolicyProto;
 import org.apache.hadoop.hdfs.protocol.proto.HdfsProtos.DatanodeIDProto;
 import org.apache.hadoop.hdfs.protocol.proto.HdfsProtos.DatanodeInfoProto;
 import org.apache.hadoop.hdfs.protocol.proto.HdfsProtos.LocatedBlockProto;
@@ -205,7 +214,7 @@ import org.apache.hadoop.hdfs.protocol.proto.XAttrProtos.SetXAttrRequestProto;
 import org.apache.hadoop.hdfs.protocol.proto.XAttrProtos.SetXAttrResponseProto;
 import org.apache.hadoop.hdfs.security.token.block.DataEncryptionKey;
 import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifier;
-import org.apache.hadoop.hdfs.server.namenode.INodeId;
+import org.apache.hadoop.io.EnumSetWritable;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.security.proto.SecurityProtos.CancelDelegationTokenRequestProto;
 import org.apache.hadoop.security.proto.SecurityProtos.CancelDelegationTokenResponseProto;
@@ -247,9 +256,6 @@ public class ClientNamenodeProtocolServerSideTranslatorPB implements
   private static final CreateResponseProto VOID_CREATE_RESPONSE = 
   CreateResponseProto.newBuilder().build();
 
-  private static final AppendResponseProto VOID_APPEND_RESPONSE = 
-  AppendResponseProto.newBuilder().build();
-
   private static final SetPermissionResponseProto VOID_SET_PERM_RESPONSE = 
   SetPermissionResponseProto.newBuilder().build();
 
@@ -274,10 +280,7 @@ public class ClientNamenodeProtocolServerSideTranslatorPB implements
   private static final RenewLeaseResponseProto VOID_RENEWLEASE_RESPONSE = 
   RenewLeaseResponseProto.newBuilder().build();
 
-  private static final SaveNamespaceResponseProto VOID_SAVENAMESPACE_RESPONSE = 
-  SaveNamespaceResponseProto.newBuilder().build();
-
-  private static final RefreshNodesResponseProto VOID_REFRESHNODES_RESPONSE = 
+  private static final RefreshNodesResponseProto VOID_REFRESHNODES_RESPONSE =
   RefreshNodesResponseProto.newBuilder().build();
 
   private static final FinalizeUpgradeResponseProto VOID_FINALIZEUPGRADE_RESPONSE = 
@@ -407,17 +410,24 @@ public class ClientNamenodeProtocolServerSideTranslatorPB implements
       throw new ServiceException(e);
     }
   }
-  
+
   @Override
   public AppendResponseProto append(RpcController controller,
       AppendRequestProto req) throws ServiceException {
     try {
-      LocatedBlock result = server.append(req.getSrc(), req.getClientName());
-      if (result != null) {
-        return AppendResponseProto.newBuilder()
-            .setBlock(PBHelper.convert(result)).build();
+      EnumSetWritable<CreateFlag> flags = req.hasFlag() ?
+          PBHelper.convertCreateFlag(req.getFlag()) :
+          new EnumSetWritable<>(EnumSet.of(CreateFlag.APPEND));
+      LastBlockWithStatus result = server.append(req.getSrc(),
+          req.getClientName(), flags);
+      AppendResponseProto.Builder builder = AppendResponseProto.newBuilder();
+      if (result.getLastBlock() != null) {
+        builder.setBlock(PBHelper.convert(result.getLastBlock()));
       }
-      return VOID_APPEND_RESPONSE;
+      if (result.getFileStatus() != null) {
+        builder.setStat(PBHelper.convert(result.getFileStatus()));
+      }
+      return builder.build();
     } catch (IOException e) {
       throw new ServiceException(e);
     }
@@ -464,7 +474,7 @@ public class ClientNamenodeProtocolServerSideTranslatorPB implements
   public AbandonBlockResponseProto abandonBlock(RpcController controller,
       AbandonBlockRequestProto req) throws ServiceException {
     try {
-      server.abandonBlock(PBHelper.convert(req.getB()), req.getFileId(),
+      server.abandonBlock(PBHelperClient.convert(req.getB()), req.getFileId(),
           req.getSrc(), req.getHolder());
     } catch (IOException e) {
       throw new ServiceException(e);
@@ -482,7 +492,7 @@ public class ClientNamenodeProtocolServerSideTranslatorPB implements
       LocatedBlock result = server.addBlock(
           req.getSrc(),
           req.getClientName(),
-          req.hasPrevious() ? PBHelper.convert(req.getPrevious()) : null,
+          req.hasPrevious() ? PBHelperClient.convert(req.getPrevious()) : null,
           (excl == null || excl.size() == 0) ? null : PBHelper.convert(excl
               .toArray(new DatanodeInfoProto[excl.size()])), req.getFileId(),
           (favor == null || favor.size() == 0) ? null : favor
@@ -503,7 +513,7 @@ public class ClientNamenodeProtocolServerSideTranslatorPB implements
       List<String> existingStorageIDsList = req.getExistingStorageUuidsList();
       List<DatanodeInfoProto> excludesList = req.getExcludesList();
       LocatedBlock result = server.getAdditionalDatanode(req.getSrc(),
-          req.getFileId(), PBHelper.convert(req.getBlk()),
+          req.getFileId(), PBHelperClient.convert(req.getBlk()),
           PBHelper.convert(existingList.toArray(
               new DatanodeInfoProto[existingList.size()])),
           existingStorageIDsList.toArray(
@@ -518,15 +528,15 @@ public class ClientNamenodeProtocolServerSideTranslatorPB implements
       throw new ServiceException(e);
     }
   }
-  
+
   @Override
   public CompleteResponseProto complete(RpcController controller,
       CompleteRequestProto req) throws ServiceException {
     try {
       boolean result = 
           server.complete(req.getSrc(), req.getClientName(),
-          req.hasLast() ? PBHelper.convert(req.getLast()) : null,
-          req.hasFileId() ? req.getFileId() : INodeId.GRANDFATHER_INODE_ID);
+          req.hasLast() ? PBHelperClient.convert(req.getLast()) : null,
+          req.hasFileId() ? req.getFileId() : HdfsConstants.GRANDFATHER_INODE_ID);
       return CompleteResponseProto.newBuilder().setResult(result).build();
     } catch (IOException e) {
       throw new ServiceException(e);
@@ -580,6 +590,18 @@ public class ClientNamenodeProtocolServerSideTranslatorPB implements
       throw new ServiceException(e);
     }   
     return VOID_RENAME2_RESPONSE;
+  }
+
+  @Override
+  public TruncateResponseProto truncate(RpcController controller,
+      TruncateRequestProto req) throws ServiceException {
+    try {
+      boolean result = server.truncate(req.getSrc(), req.getNewLength(),
+          req.getClientName());
+      return TruncateResponseProto.newBuilder().setResult(result).build();
+    } catch (IOException e) {
+      throw new ServiceException(e);
+    }
   }
 
   @Override
@@ -673,7 +695,7 @@ public class ClientNamenodeProtocolServerSideTranslatorPB implements
       RpcController controller, GetDatanodeReportRequestProto req)
       throws ServiceException {
     try {
-      List<? extends DatanodeInfoProto> result = PBHelper.convert(server
+      List<? extends DatanodeInfoProto> result = PBHelperClient.convert(server
           .getDatanodeReport(PBHelper.convert(req.getType())));
       return GetDatanodeReportResponseProto.newBuilder()
           .addAllDi(result).build();
@@ -726,14 +748,15 @@ public class ClientNamenodeProtocolServerSideTranslatorPB implements
   public SaveNamespaceResponseProto saveNamespace(RpcController controller,
       SaveNamespaceRequestProto req) throws ServiceException {
     try {
-      server.saveNamespace();
-      return VOID_SAVENAMESPACE_RESPONSE;
+      final long timeWindow = req.hasTimeWindow() ? req.getTimeWindow() : 0;
+      final long txGap = req.hasTxGap() ? req.getTxGap() : 0;
+      boolean saved = server.saveNamespace(timeWindow, txGap);
+      return SaveNamespaceResponseProto.newBuilder().setSaved(saved).build();
     } catch (IOException e) {
       throw new ServiceException(e);
     }
-
   }
-  
+
   @Override
   public RollEditsResponseProto rollEdits(RpcController controller,
       RollEditsRequestProto request) throws ServiceException {
@@ -865,7 +888,9 @@ public class ClientNamenodeProtocolServerSideTranslatorPB implements
       SetQuotaRequestProto req) throws ServiceException {
     try {
       server.setQuota(req.getPath(), req.getNamespaceQuota(),
-          req.getDiskspaceQuota());
+          req.getStoragespaceQuota(),
+          req.hasStorageType() ?
+          PBHelperClient.convertStorageType(req.getStorageType()): null);
       return VOID_SETQUOTA_RESPONSE;
     } catch (IOException e) {
       throw new ServiceException(e);
@@ -929,7 +954,7 @@ public class ClientNamenodeProtocolServerSideTranslatorPB implements
       throws ServiceException {
     try {
       LocatedBlockProto result = PBHelper.convert(server
-          .updateBlockForPipeline(PBHelper.convert(req.getBlock()),
+          .updateBlockForPipeline(PBHelperClient.convert(req.getBlock()),
               req.getClientName()));
       return UpdateBlockForPipelineResponseProto.newBuilder().setBlock(result)
           .build();
@@ -945,8 +970,8 @@ public class ClientNamenodeProtocolServerSideTranslatorPB implements
       List<DatanodeIDProto> newNodes = req.getNewNodesList();
       List<String> newStorageIDs = req.getStorageIDsList();
       server.updatePipeline(req.getClientName(),
-          PBHelper.convert(req.getOldBlock()),
-          PBHelper.convert(req.getNewBlock()),
+          PBHelperClient.convert(req.getOldBlock()),
+          PBHelperClient.convert(req.getNewBlock()),
           PBHelper.convert(newNodes.toArray(new DatanodeIDProto[newNodes.size()])),
           newStorageIDs.toArray(new String[newStorageIDs.size()]));
       return VOID_UPDATEPIPELINE_RESPONSE;
@@ -965,7 +990,7 @@ public class ClientNamenodeProtocolServerSideTranslatorPB implements
       GetDelegationTokenResponseProto.Builder rspBuilder = 
           GetDelegationTokenResponseProto.newBuilder();
       if (token != null) {
-        rspBuilder.setToken(PBHelper.convert(token));
+        rspBuilder.setToken(PBHelperClient.convert(token));
       }
       return rspBuilder.build();
     } catch (IOException e) {
@@ -1433,6 +1458,20 @@ public class ClientNamenodeProtocolServerSideTranslatorPB implements
       throw new ServiceException(e);
     }
     return VOID_SET_STORAGE_POLICY_RESPONSE;
+  }
+
+  @Override
+  public GetStoragePolicyResponseProto getStoragePolicy(
+      RpcController controller, GetStoragePolicyRequestProto request)
+      throws ServiceException {
+    try {
+      BlockStoragePolicyProto policy = PBHelper.convert(server
+          .getStoragePolicy(request.getPath()));
+      return GetStoragePolicyResponseProto.newBuilder()
+          .setStoragePolicy(policy).build();
+    } catch (IOException e) {
+      throw new ServiceException(e);
+    }
   }
 
   @Override

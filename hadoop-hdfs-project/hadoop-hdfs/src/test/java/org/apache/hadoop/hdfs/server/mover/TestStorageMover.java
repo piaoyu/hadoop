@@ -32,8 +32,8 @@ import org.apache.commons.logging.impl.Log4JLogger;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
-import org.apache.hadoop.fs.FileUtil;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.StorageType;
 import org.apache.hadoop.hdfs.protocol.BlockStoragePolicy;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.DFSOutputStream;
@@ -42,8 +42,8 @@ import org.apache.hadoop.hdfs.DFSUtil;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.hadoop.hdfs.HdfsConfiguration;
 import org.apache.hadoop.hdfs.MiniDFSCluster;
-import org.apache.hadoop.hdfs.StorageType;
 import org.apache.hadoop.hdfs.protocol.DirectoryListing;
+import org.apache.hadoop.hdfs.protocol.HdfsConstants;
 import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
 import org.apache.hadoop.hdfs.protocol.HdfsLocatedFileStatus;
 import org.apache.hadoop.hdfs.protocol.LocatedBlock;
@@ -56,6 +56,7 @@ import org.apache.hadoop.hdfs.server.blockmanagement.BlockPlacementPolicy;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockStoragePolicySuite;
 import org.apache.hadoop.hdfs.server.datanode.DataNode;
 import org.apache.hadoop.hdfs.server.datanode.DataNodeTestUtils;
+import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsDatasetSpi;
 import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsVolumeSpi;
 import org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsVolumeImpl;
 import org.apache.hadoop.hdfs.server.namenode.snapshot.SnapshotTestHelper;
@@ -66,8 +67,6 @@ import org.junit.Test;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Maps;
-
-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DATANODE_LAZY_WRITER_INTERVAL_SEC;
 
 /**
  * Test the data migration tool (for Archival Storage)
@@ -100,9 +99,9 @@ public class TestStorageMover {
     DEFAULT_CONF.setLong(DFSConfigKeys.DFS_MOVER_MOVEDWINWIDTH_KEY, 2000L);
 
     DEFAULT_POLICIES = BlockStoragePolicySuite.createDefaultSuite();
-    HOT = DEFAULT_POLICIES.getPolicy("HOT");
-    WARM = DEFAULT_POLICIES.getPolicy("WARM");
-    COLD = DEFAULT_POLICIES.getPolicy("COLD");
+    HOT = DEFAULT_POLICIES.getPolicy(HdfsConstants.HOT_STORAGE_POLICY_NAME);
+    WARM = DEFAULT_POLICIES.getPolicy(HdfsConstants.WARM_STORAGE_POLICY_NAME);
+    COLD = DEFAULT_POLICIES.getPolicy(HdfsConstants.COLD_STORAGE_POLICY_NAME);
     TestBalancer.initTestSetup();
     Dispatcher.setDelayAfterErrors(1000L);
   }
@@ -201,14 +200,6 @@ public class TestStorageMover {
       this.policies = DEFAULT_POLICIES;
     }
 
-    MigrationTest(ClusterScheme cScheme, NamespaceScheme nsScheme,
-        BlockStoragePolicySuite policies) {
-      this.clusterScheme = cScheme;
-      this.nsScheme = nsScheme;
-      this.conf = clusterScheme.conf;
-      this.policies = policies;
-    }
-
     /**
      * Set up the cluster and start NameNode and DataNodes according to the
      * corresponding scheme.
@@ -228,7 +219,7 @@ public class TestStorageMover {
         verify(true);
 
         setStoragePolicy();
-        migrate();
+        migrate(ExitStatus.SUCCESS);
         verify(true);
       } finally {
         if (shutdown) {
@@ -259,8 +250,8 @@ public class TestStorageMover {
     /**
      * Run the migration tool.
      */
-    void migrate() throws Exception {
-      runMover();
+    void migrate(ExitStatus expectedExitCode) throws Exception {
+      runMover(expectedExitCode);
       Thread.sleep(5000); // let the NN finish deletion
     }
 
@@ -273,20 +264,17 @@ public class TestStorageMover {
       }
       if (verifyAll) {
         verifyNamespace();
-      } else {
-        // TODO verify according to the given path list
-
       }
     }
 
-    private void runMover() throws Exception {
+    private void runMover(ExitStatus expectedExitCode) throws Exception {
       Collection<URI> namenodes = DFSUtil.getNsServiceRpcUris(conf);
       Map<URI, List<Path>> nnMap = Maps.newHashMap();
       for (URI nn : namenodes) {
         nnMap.put(nn, null);
       }
       int result = Mover.run(nnMap, conf);
-      Assert.assertEquals(ExitStatus.SUCCESS.getExitCode(), result);
+      Assert.assertEquals(expectedExitCode.getExitCode(), result);
     }
 
     private void verifyNamespace() throws Exception {
@@ -414,11 +402,6 @@ public class TestStorageMover {
   }
 
   private static StorageType[][] genStorageTypes(int numDataNodes,
-      int numAllDisk, int numAllArchive) {
-    return genStorageTypes(numDataNodes, numAllDisk, numAllArchive, 0);
-  }
-
-  private static StorageType[][] genStorageTypes(int numDataNodes,
       int numAllDisk, int numAllArchive, int numRamDisk) {
     Preconditions.checkArgument(
       (numAllDisk + numAllArchive + numRamDisk) <= numDataNodes);
@@ -439,26 +422,6 @@ public class TestStorageMover {
       types[i] = new StorageType[]{StorageType.DISK, StorageType.ARCHIVE};
     }
     return types;
-  }
-
-  private static long[][] genCapacities(int nDatanodes, int numAllDisk,
-      int numAllArchive, int numRamDisk, long diskCapacity,
-      long archiveCapacity, long ramDiskCapacity) {
-    final long[][] capacities = new long[nDatanodes][];
-    int i = 0;
-    for (; i < numRamDisk; i++) {
-      capacities[i] = new long[]{ramDiskCapacity, diskCapacity};
-    }
-    for (; i < numRamDisk + numAllDisk; i++) {
-      capacities[i] = new long[]{diskCapacity, diskCapacity};
-    }
-    for (; i < numRamDisk + numAllDisk + numAllArchive; i++) {
-      capacities[i] = new long[]{archiveCapacity, archiveCapacity};
-    }
-    for(; i < capacities.length; i++) {
-      capacities[i] = new long[]{diskCapacity, archiveCapacity};
-    }
-    return capacities;
   }
 
   private static class PathPolicyMap {
@@ -592,7 +555,7 @@ public class TestStorageMover {
     try {
       banner("start data migration");
       test.setStoragePolicy(); // set /foo to COLD
-      test.migrate();
+      test.migrate(ExitStatus.SUCCESS);
 
       // make sure the under construction block has not been migrated
       LocatedBlocks lbs = test.dfs.getClient().getLocatedBlocks(
@@ -642,7 +605,7 @@ public class TestStorageMover {
     try {
       test.runBasicTest(false);
       pathPolicyMap.moveAround(test.dfs);
-      test.migrate();
+      test.migrate(ExitStatus.SUCCESS);
 
       test.verify(true);
     } finally {
@@ -665,14 +628,18 @@ public class TestStorageMover {
   }
 
   private void setVolumeFull(DataNode dn, StorageType type) {
-    List<? extends FsVolumeSpi> volumes = dn.getFSDataset().getVolumes();
-    for (int j = 0; j < volumes.size(); ++j) {
-      FsVolumeImpl volume = (FsVolumeImpl) volumes.get(j);
-      if (volume.getStorageType() == type) {
-        LOG.info("setCapacity to 0 for [" + volume.getStorageType() + "]"
-            + volume.getStorageID());
-        volume.setCapacityForTesting(0);
+    try (FsDatasetSpi.FsVolumeReferences refs = dn.getFSDataset()
+        .getFsVolumeReferences()) {
+      for (FsVolumeSpi fvs : refs) {
+        FsVolumeImpl volume = (FsVolumeImpl) fvs;
+        if (volume.getStorageType() == type) {
+          LOG.info("setCapacity to 0 for [" + volume.getStorageType() + "]"
+              + volume.getStorageID());
+          volume.setCapacityForTesting(0);
+        }
       }
+    } catch (IOException e) {
+      LOG.error("Unexpected exception by closing FsVolumeReference", e);
     }
   }
 
@@ -728,7 +695,7 @@ public class TestStorageMover {
       //test move a hot file to warm
       final Path file1 = new Path(pathPolicyMap.hot, "file1");
       test.dfs.rename(file1, pathPolicyMap.warm);
-      test.migrate();
+      test.migrate(ExitStatus.NO_MOVE_BLOCK);
       test.verifyFile(new Path(pathPolicyMap.warm, "file1"), WARM.getId());
     } finally {
       test.shutdownCluster();
@@ -786,7 +753,7 @@ public class TestStorageMover {
       { //test move a cold file to warm
         final Path file1 = new Path(pathPolicyMap.cold, "file1");
         test.dfs.rename(file1, pathPolicyMap.warm);
-        test.migrate();
+        test.migrate(ExitStatus.SUCCESS);
         test.verify(true);
       }
     } finally {

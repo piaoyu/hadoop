@@ -48,7 +48,6 @@ import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.exceptions.YarnException;
 import org.apache.hadoop.yarn.server.sharedcache.SharedCacheUtil;
 import org.apache.hadoop.yarn.server.sharedcachemanager.AppChecker;
-import org.apache.hadoop.yarn.server.sharedcachemanager.SharedCacheManager;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
@@ -83,13 +82,17 @@ public class InMemorySCMStore extends SCMStore {
   private final Object initialAppsLock = new Object();
   private long startTime;
   private int stalenessMinutes;
-  private AppChecker appChecker;
   private ScheduledExecutorService scheduler;
   private int initialDelayMin;
   private int checkPeriodMin;
 
   public InMemorySCMStore() {
     super(InMemorySCMStore.class.getName());
+  }
+
+  @VisibleForTesting
+  public InMemorySCMStore(AppChecker appChecker) {
+    super(InMemorySCMStore.class.getName(), appChecker);
   }
 
   private String intern(String key) {
@@ -107,9 +110,6 @@ public class InMemorySCMStore extends SCMStore {
     this.initialDelayMin = getInitialDelay(conf);
     this.checkPeriodMin = getCheckPeriod(conf);
     this.stalenessMinutes = getStalenessPeriod(conf);
-
-    appChecker = createAppCheckerService(conf);
-    addService(appChecker);
 
     bootstrap(conf);
 
@@ -142,24 +142,23 @@ public class InMemorySCMStore extends SCMStore {
 
   @Override
   protected void serviceStop() throws Exception {
-    LOG.info("Shutting down the background thread.");
-    scheduler.shutdownNow();
-    try {
-      if (!scheduler.awaitTermination(10, TimeUnit.SECONDS)) {
-        LOG.warn("Gave up waiting for the app check task to shutdown.");
+    LOG.info("Stopping the " + InMemorySCMStore.class.getSimpleName()
+        + " service.");
+    if (scheduler != null) {
+      LOG.info("Shutting down the background thread.");
+      scheduler.shutdownNow();
+      try {
+        if (!scheduler.awaitTermination(10, TimeUnit.SECONDS)) {
+          LOG.warn("Gave up waiting for the app check task to shutdown.");
+        }
+      } catch (InterruptedException e) {
+        LOG.warn(
+            "The InMemorySCMStore was interrupted while shutting down the "
+                + "app check task.", e);
       }
-    } catch (InterruptedException e) {
-      LOG.warn("The InMemorySCMStore was interrupted while shutting down the "
-          + "app check task.", e);
+      LOG.info("The background thread stopped.");
     }
-    LOG.info("The background thread stopped.");
-
     super.serviceStop();
-  }
-
-  @VisibleForTesting
-  AppChecker createAppCheckerService(Configuration conf) {
-    return SharedCacheManager.createAppCheckerService(conf);
   }
 
   private void bootstrap(Configuration conf) throws IOException {
@@ -201,14 +200,10 @@ public class InMemorySCMStore extends SCMStore {
     // now traverse individual directories and process them
     // the directory structure is specified by the nested level parameter
     // (e.g. 9/c/d/<checksum>/file)
-    StringBuilder pattern = new StringBuilder();
-    for (int i = 0; i < nestedLevel + 1; i++) {
-      pattern.append("*/");
-    }
-    pattern.append("*");
+    String pattern = SharedCacheUtil.getCacheEntryGlobPattern(nestedLevel+1);
 
     LOG.info("Querying for all individual cached resource files");
-    FileStatus[] entries = fs.globStatus(new Path(root, pattern.toString()));
+    FileStatus[] entries = fs.globStatus(new Path(root, pattern));
     int numEntries = entries == null ? 0 : entries.length;
     LOG.info("Found " + numEntries + " files: processing for one resource per "
         + "key");
@@ -360,6 +355,17 @@ public class InMemorySCMStore extends SCMStore {
   }
 
   /**
+   * Provides atomicity for the method.
+   */
+  @Override
+  public void cleanResourceReferences(String key) throws YarnException {
+    String interned = intern(key);
+    synchronized (interned) {
+      super.cleanResourceReferences(key);
+    }
+  }
+
+  /**
    * Removes the given resource from the store. Returns true if the resource is
    * found and removed or if the resource is not found. Returns false if it was
    * unable to remove the resource because the resource reference list was not
@@ -427,8 +433,8 @@ public class InMemorySCMStore extends SCMStore {
 
   private static int getStalenessPeriod(Configuration conf) {
     int stalenessMinutes =
-        conf.getInt(YarnConfiguration.IN_MEMORY_STALENESS_PERIOD,
-            YarnConfiguration.DEFAULT_IN_MEMORY_STALENESS_PERIOD);
+        conf.getInt(YarnConfiguration.IN_MEMORY_STALENESS_PERIOD_MINS,
+            YarnConfiguration.DEFAULT_IN_MEMORY_STALENESS_PERIOD_MINS);
     // non-positive value is invalid; use the default
     if (stalenessMinutes <= 0) {
       throw new HadoopIllegalArgumentException("Non-positive staleness value: "
@@ -440,8 +446,8 @@ public class InMemorySCMStore extends SCMStore {
 
   private static int getInitialDelay(Configuration conf) {
     int initialMinutes =
-        conf.getInt(YarnConfiguration.IN_MEMORY_INITIAL_DELAY,
-            YarnConfiguration.DEFAULT_IN_MEMORY_INITIAL_DELAY);
+        conf.getInt(YarnConfiguration.IN_MEMORY_INITIAL_DELAY_MINS,
+            YarnConfiguration.DEFAULT_IN_MEMORY_INITIAL_DELAY_MINS);
     // non-positive value is invalid; use the default
     if (initialMinutes <= 0) {
       throw new HadoopIllegalArgumentException(
@@ -453,8 +459,8 @@ public class InMemorySCMStore extends SCMStore {
 
   private static int getCheckPeriod(Configuration conf) {
     int checkMinutes =
-        conf.getInt(YarnConfiguration.IN_MEMORY_CHECK_PERIOD,
-            YarnConfiguration.DEFAULT_IN_MEMORY_CHECK_PERIOD);
+        conf.getInt(YarnConfiguration.IN_MEMORY_CHECK_PERIOD_MINS,
+            YarnConfiguration.DEFAULT_IN_MEMORY_CHECK_PERIOD_MINS);
     // non-positive value is invalid; use the default
     if (checkMinutes <= 0) {
       throw new HadoopIllegalArgumentException(

@@ -192,14 +192,17 @@ public class RegistrySecurity extends AbstractService {
     String auth = conf.getTrimmed(KEY_REGISTRY_CLIENT_AUTH,
         REGISTRY_CLIENT_AUTH_ANONYMOUS);
 
-    // TODO JDK7 SWITCH
-    if (REGISTRY_CLIENT_AUTH_KERBEROS.equals(auth)) {
+    switch (auth) {
+    case REGISTRY_CLIENT_AUTH_KERBEROS:
       access = AccessPolicy.sasl;
-    } else if (REGISTRY_CLIENT_AUTH_DIGEST.equals(auth)) {
+      break;
+    case REGISTRY_CLIENT_AUTH_DIGEST:
       access = AccessPolicy.digest;
-    } else if (REGISTRY_CLIENT_AUTH_ANONYMOUS.equals(auth)) {
+      break;
+    case REGISTRY_CLIENT_AUTH_ANONYMOUS:
       access = AccessPolicy.anon;
-    } else {
+      break;
+    default:
       throw new ServiceStateException(E_UNKNOWN_AUTHENTICATION_MECHANISM
                                       + "\"" + auth + "\"");
     }
@@ -592,16 +595,17 @@ public class RegistrySecurity extends AbstractService {
    * Note the semicolon on the last entry
    */
   private static final String JAAS_ENTRY =
-      "%s { \n"
-      + " %s required\n"
+      "%s { %n"
+      + " %s required%n"
       // kerberos module
-      + " keyTab=\"%s\"\n"
-      + " principal=\"%s\"\n"
-      + " useKeyTab=true\n"
-      + " useTicketCache=false\n"
-      + " doNotPrompt=true\n"
-      + " storeKey=true;\n"
-      + "}; \n"
+      + " keyTab=\"%s\"%n"
+      + " debug=true%n"
+      + " principal=\"%s\"%n"
+      + " useKeyTab=true%n"
+      + " useTicketCache=false%n"
+      + " doNotPrompt=true%n"
+      + " storeKey=true;%n"
+      + "}; %n"
       ;
 
   /**
@@ -621,12 +625,15 @@ public class RegistrySecurity extends AbstractService {
         "invalid context");
     Preconditions.checkArgument(keytab != null && keytab.isFile(),
         "Keytab null or missing: ");
+    String keytabpath = keytab.getAbsolutePath();
+    // fix up for windows; no-op on unix
+    keytabpath =  keytabpath.replace('\\', '/');
     return String.format(
         Locale.ENGLISH,
         JAAS_ENTRY,
         context,
         getKerberosAuthModuleForJVM(),
-        keytab.getAbsolutePath(),
+        keytabpath,
         principal);
   }
 
@@ -846,11 +853,11 @@ public class RegistrySecurity extends AbstractService {
     StringBuilder builder = new StringBuilder();
     builder.append(secureRegistry ? "secure registry; "
                           : "insecure registry; ");
-    builder.append("Access policy: ").append(access);
+    builder.append("Curator service access policy: ").append(access);
 
-    builder.append(", System ACLs: ").append(aclsToString(systemACLs));
-    builder.append(UgiInfo.fromCurrentUser());
-    builder.append(" Kerberos Realm: ").append(kerberosRealm).append(" ; ");
+    builder.append("; System ACLs: ").append(aclsToString(systemACLs));
+    builder.append("User: ").append(UgiInfo.fromCurrentUser());
+    builder.append("; Kerberos Realm: ").append(kerberosRealm);
     builder.append(describeProperty(Environment.JAAS_CONF_KEY));
     String sasl =
         System.getProperty(PROP_ZK_ENABLE_SASL_CLIENT,
@@ -859,7 +866,7 @@ public class RegistrySecurity extends AbstractService {
     builder.append(describeProperty(PROP_ZK_ENABLE_SASL_CLIENT,
         DEFAULT_ZK_ENABLE_SASL_CLIENT));
     if (saslEnabled) {
-      builder.append("JAAS Client Identity")
+      builder.append("; JAAS Client Identity")
              .append("=")
              .append(jaasClientIdentity)
              .append("; ");

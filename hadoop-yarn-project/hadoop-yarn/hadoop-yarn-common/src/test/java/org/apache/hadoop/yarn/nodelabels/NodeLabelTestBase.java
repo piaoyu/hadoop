@@ -19,11 +19,14 @@
 package org.apache.hadoop.yarn.nodelabels;
 
 import java.util.Collection;
-import java.util.Iterator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.Map.Entry;
 
 import org.apache.hadoop.yarn.api.records.NodeId;
+import org.apache.hadoop.yarn.api.records.NodeLabel;
 import org.junit.Assert;
 
 import com.google.common.collect.ImmutableMap;
@@ -39,6 +42,46 @@ public class NodeLabelTestBase {
     }
   }
 
+  public static void assertLabelInfoMapEquals(Map<NodeId, Set<NodeLabel>> m1,
+      ImmutableMap<NodeId, Set<NodeLabel>> m2) {
+    Assert.assertEquals(m1.size(), m2.size());
+    for (NodeId k : m1.keySet()) {
+      Assert.assertTrue(m2.containsKey(k));
+      assertNLCollectionEquals(m1.get(k), m2.get(k));
+    }
+  }
+
+  public static void assertLabelsToNodesEquals(Map<String, Set<NodeId>> m1,
+      ImmutableMap<String, Set<NodeId>> m2) {
+    Assert.assertEquals(m1.size(), m2.size());
+    for (String k : m1.keySet()) {
+      Assert.assertTrue(m2.containsKey(k));
+      Set<NodeId> s1 = new HashSet<NodeId>(m1.get(k));
+      Set<NodeId> s2 = new HashSet<NodeId>(m2.get(k));
+      Assert.assertEquals(s1, s2);
+      Assert.assertTrue(s1.containsAll(s2));
+    }
+  }
+
+  public static ImmutableMap<String, Set<NodeId>> transposeNodeToLabels(
+      Map<NodeId, Set<String>> mapNodeToLabels) {
+    Map<String, Set<NodeId>> mapLabelsToNodes =
+        new HashMap<String, Set<NodeId>>();
+    for(Entry<NodeId, Set<String>> entry : mapNodeToLabels.entrySet()) {
+      NodeId node = entry.getKey();
+      Set<String> setLabels = entry.getValue();
+      for(String label : setLabels) {
+        Set<NodeId> setNode = mapLabelsToNodes.get(label);
+        if (setNode == null) {
+          setNode = new HashSet<NodeId>();
+        }
+        setNode.add(NodeId.newInstance(node.getHost(), node.getPort()));
+        mapLabelsToNodes.put(label, setNode);
+      }
+    }
+    return ImmutableMap.copyOf(mapLabelsToNodes);
+  }
+
   public static void assertMapContains(Map<NodeId, Set<String>> m1,
       ImmutableMap<NodeId, Set<String>> m2) {
     for (NodeId k : m2.keySet()) {
@@ -49,19 +92,38 @@ public class NodeLabelTestBase {
 
   public static void assertCollectionEquals(Collection<String> c1,
       Collection<String> c2) {
-    Assert.assertEquals(c1.size(), c2.size());
-    Iterator<String> i1 = c1.iterator();
-    Iterator<String> i2 = c2.iterator();
-    while (i1.hasNext()) {
-      Assert.assertEquals(i1.next(), i2.next());
-    }
+    Set<String> s1 = new HashSet<String>(c1);
+    Set<String> s2 = new HashSet<String>(c2);
+    Assert.assertEquals(s1, s2);
+    Assert.assertTrue(s1.containsAll(s2));
   }
 
+  public static void assertNLCollectionEquals(Collection<NodeLabel> c1,
+      Collection<NodeLabel> c2) {
+    Set<NodeLabel> s1 = new HashSet<NodeLabel>(c1);
+    Set<NodeLabel> s2 = new HashSet<NodeLabel>(c2);
+    Assert.assertEquals(s1, s2);
+    Assert.assertTrue(s1.containsAll(s2));
+  }
+
+  @SuppressWarnings("unchecked")
   public static <E> Set<E> toSet(E... elements) {
     Set<E> set = Sets.newHashSet(elements);
     return set;
   }
   
+  @SuppressWarnings("unchecked")
+  public static Set<NodeLabel> toNodeLabelSet(String... nodeLabelsStr) {
+    if (null == nodeLabelsStr) {
+      return null;
+    }
+    Set<NodeLabel> labels = new HashSet<NodeLabel>();
+    for (String label : nodeLabelsStr) {
+      labels.add(NodeLabel.newInstance(label));
+    }
+    return labels;
+  }
+
   public NodeId toNodeId(String str) {
     if (str.contains(":")) {
       int idx = str.indexOf(':');
@@ -71,6 +133,18 @@ public class NodeLabelTestBase {
       return id;
     } else {
       return NodeId.newInstance(str, CommonNodeLabelsManager.WILDCARD_PORT);
+    }
+  }
+
+  public static void assertLabelsInfoToNodesEquals(
+      Map<NodeLabel, Set<NodeId>> m1, ImmutableMap<NodeLabel, Set<NodeId>> m2) {
+    Assert.assertEquals(m1.size(), m2.size());
+    for (NodeLabel k : m1.keySet()) {
+      Assert.assertTrue(m2.containsKey(k));
+      Set<NodeId> s1 = new HashSet<NodeId>(m1.get(k));
+      Set<NodeId> s2 = new HashSet<NodeId>(m2.get(k));
+      Assert.assertEquals(s1, s2);
+      Assert.assertTrue(s1.containsAll(s2));
     }
   }
 }

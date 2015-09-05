@@ -119,6 +119,8 @@ import org.apache.hadoop.yarn.server.nodemanager.containermanager.launcher.Conta
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.launcher.ContainersLauncherEventType;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.localizer.ResourceLocalizationService;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.localizer.event.LocalizationEventType;
+import org.apache.hadoop.yarn.server.nodemanager.containermanager.localizer.sharedcache.SharedCacheUploadEventType;
+import org.apache.hadoop.yarn.server.nodemanager.containermanager.localizer.sharedcache.SharedCacheUploadService;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.logaggregation.LogAggregationService;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.loghandler.LogHandler;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.loghandler.NonAggregatingLogHandler;
@@ -132,8 +134,6 @@ import org.apache.hadoop.yarn.server.nodemanager.recovery.NMStateStoreService.Re
 import org.apache.hadoop.yarn.server.nodemanager.recovery.NMStateStoreService.RecoveredContainerState;
 import org.apache.hadoop.yarn.server.nodemanager.recovery.NMStateStoreService.RecoveredContainerStatus;
 import org.apache.hadoop.yarn.server.nodemanager.security.authorize.NMPolicyProvider;
-import org.apache.hadoop.yarn.server.security.ApplicationACLsManager;
-import org.apache.hadoop.yarn.server.security.BaseNMTokenSecretManager;
 import org.apache.hadoop.yarn.server.utils.BuilderUtils;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -150,6 +150,10 @@ public class ContainerManagerImpl extends CompositeService implements
 
   private static final Log LOG = LogFactory.getLog(ContainerManagerImpl.class);
 
+  static final String INVALID_NMTOKEN_MSG = "Invalid NMToken";
+  static final String INVALID_CONTAINERTOKEN_MSG =
+      "Invalid ContainerToken";
+
   final Context context;
   private final ContainersMonitor containersMonitor;
   private Server server;
@@ -162,7 +166,6 @@ public class ContainerManagerImpl extends CompositeService implements
 
   protected LocalDirsHandlerService dirsHandler;
   protected final AsyncDispatcher dispatcher;
-  private final ApplicationACLsManager aclsManager;
 
   private final DeletionService deletionService;
   private AtomicBoolean blockNewContainerRequests = new AtomicBoolean(false);
@@ -174,8 +177,7 @@ public class ContainerManagerImpl extends CompositeService implements
 
   public ContainerManagerImpl(Context context, ContainerExecutor exec,
       DeletionService deletionContext, NodeStatusUpdater nodeStatusUpdater,
-      NodeManagerMetrics metrics, ApplicationACLsManager aclsManager,
-      LocalDirsHandlerService dirsHandler) {
+      NodeManagerMetrics metrics, LocalDirsHandlerService dirsHandler) {
     super(ContainerManagerImpl.class.getName());
     this.context = context;
     this.dirsHandler = dirsHandler;
@@ -186,14 +188,13 @@ public class ContainerManagerImpl extends CompositeService implements
     this.metrics = metrics;
 
     rsrcLocalizationSrvc =
-        createResourceLocalizationService(exec, deletionContext);
+        createResourceLocalizationService(exec, deletionContext, context);
     addService(rsrcLocalizationSrvc);
 
     containersLauncher = createContainersLauncher(context, exec);
     addService(containersLauncher);
 
     this.nodeStatusUpdater = nodeStatusUpdater;
-    this.aclsManager = aclsManager;
 
     // Start configurable services
     auxiliaryServices = new AuxServices();
@@ -227,6 +228,13 @@ public class ContainerManagerImpl extends CompositeService implements
     addIfService(logHandler);
     dispatcher.register(LogHandlerEventType.class, logHandler);
     
+    // add the shared cache upload service (it will do nothing if the shared
+    // cache is disabled)
+    SharedCacheUploadService sharedCacheUploader =
+        createSharedCacheUploaderService();
+    addService(sharedCacheUploader);
+    dispatcher.register(SharedCacheUploadEventType.class, sharedCacheUploader);
+
     waitForContainersOnShutdownMillis =
         conf.getLong(YarnConfiguration.NM_SLEEP_DELAY_BEFORE_SIGKILL_MS,
             YarnConfiguration.DEFAULT_NM_SLEEP_DELAY_BEFORE_SIGKILL_MS) +
@@ -353,7 +361,8 @@ public class ContainerManagerImpl extends CompositeService implements
           deletionService, dirsHandler);
     } else {
       return new NonAggregatingLogHandler(this.dispatcher, deletionService,
-                                          dirsHandler);
+                                          dirsHandler,
+                                          context.getNMStateStore());
     }
   }
 
@@ -362,9 +371,13 @@ public class ContainerManagerImpl extends CompositeService implements
   }
 
   protected ResourceLocalizationService createResourceLocalizationService(
-      ContainerExecutor exec, DeletionService deletionContext) {
+      ContainerExecutor exec, DeletionService deletionContext, Context context) {
     return new ResourceLocalizationService(this.dispatcher, exec,
-        deletionContext, dirsHandler, context.getNMStateStore());
+        deletionContext, dirsHandler, context);
+  }
+
+  protected SharedCacheUploadService createSharedCacheUploaderService() {
+    return new SharedCacheUploadService();
   }
 
   protected ContainersLauncher createContainersLauncher(Context context,
@@ -513,8 +526,11 @@ public class ContainerManagerImpl extends CompositeService implements
 
     if (this.context.getNMStateStore().canRecover()
         && !this.context.getDecommissioned()) {
-      // do not cleanup apps as they can be recovered on restart
-      return;
+      if (getConfig().getBoolean(YarnConfiguration.NM_RECOVERY_SUPERVISED,
+          YarnConfiguration.DEFAULT_NM_RECOVERY_SUPERVISED)) {
+        // do not cleanup apps as they can be recovered on restart
+        return;
+      }
     }
 
     List<ApplicationId> appIds =
@@ -628,6 +644,9 @@ public class ContainerManagerImpl extends CompositeService implements
 
   protected void authorizeUser(UserGroupInformation remoteUgi,
       NMTokenIdentifier nmTokenIdentifier) throws YarnException {
+    if (nmTokenIdentifier == null) {
+      throw RPCUtil.getRemoteException(INVALID_NMTOKEN_MSG);
+    }
     if (!remoteUgi.getUserName().equals(
       nmTokenIdentifier.getApplicationAttemptId().toString())) {
       throw RPCUtil.getRemoteException("Expected applicationAttemptId: "
@@ -645,7 +664,12 @@ public class ContainerManagerImpl extends CompositeService implements
   @VisibleForTesting
   protected void authorizeStartRequest(NMTokenIdentifier nmTokenIdentifier,
       ContainerTokenIdentifier containerTokenIdentifier) throws YarnException {
-
+    if (nmTokenIdentifier == null) {
+      throw RPCUtil.getRemoteException(INVALID_NMTOKEN_MSG);
+    }
+    if (containerTokenIdentifier == null) {
+      throw RPCUtil.getRemoteException(INVALID_CONTAINERTOKEN_MSG);
+    }
     ContainerId containerId = containerTokenIdentifier.getContainerID();
     String containerIDStr = containerId.toString();
     boolean unauthorized = false;
@@ -704,6 +728,10 @@ public class ContainerManagerImpl extends CompositeService implements
     for (StartContainerRequest request : requests.getStartContainerRequests()) {
       ContainerId containerId = null;
       try {
+        if (request.getContainerToken() == null ||
+            request.getContainerToken().getIdentifier() == null) {
+          throw new IOException(INVALID_CONTAINERTOKEN_MSG);
+        }
         ContainerTokenIdentifier containerTokenIdentifier =
             BuilderUtils.newContainerTokenIdentifier(request.getContainerToken());
         verifyAndGetContainerTokenIdentifier(request.getContainerToken(),
@@ -933,6 +961,9 @@ public class ContainerManagerImpl extends CompositeService implements
         new HashMap<ContainerId, SerializedException>();
     UserGroupInformation remoteUgi = getRemoteUgi();
     NMTokenIdentifier identifier = selectNMTokenIdentifier(remoteUgi);
+    if (identifier == null) {
+      throw RPCUtil.getRemoteException(INVALID_NMTOKEN_MSG);
+    }
     for (ContainerId id : requests.getContainerIds()) {
       try {
         stopContainerInternal(identifier, id);
@@ -988,6 +1019,9 @@ public class ContainerManagerImpl extends CompositeService implements
         new HashMap<ContainerId, SerializedException>();
     UserGroupInformation remoteUgi = getRemoteUgi();
     NMTokenIdentifier identifier = selectNMTokenIdentifier(remoteUgi);
+    if (identifier == null) {
+      throw RPCUtil.getRemoteException(INVALID_NMTOKEN_MSG);
+    }
     for (ContainerId id : request.getContainerIds()) {
       try {
         ContainerStatus status = getContainerStatusInternal(id, identifier);
@@ -1028,6 +1062,9 @@ public class ContainerManagerImpl extends CompositeService implements
   protected void authorizeGetAndStopContainerRequest(ContainerId containerId,
       Container container, boolean stopRequest, NMTokenIdentifier identifier)
       throws YarnException {
+    if (identifier == null) {
+      throw RPCUtil.getRemoteException(INVALID_NMTOKEN_MSG);
+    }
     /*
      * For get/stop container status; we need to verify that 1) User (NMToken)
      * application attempt only has started container. 2) Requested containerId

@@ -165,6 +165,7 @@ public class TestNodeManagerResync {
       throws IOException, InterruptedException, YarnException {
     NodeManager nm = new TestNodeManager2();
     YarnConfiguration conf = createNMConfig();
+    conf.setBoolean(YarnConfiguration.RM_WORK_PRESERVING_RECOVERY_ENABLED, false);
     nm.init(conf);
     nm.start();
 
@@ -434,7 +435,7 @@ public class TestNodeManagerResync {
         NodeStatusUpdater nodeStatusUpdater, ApplicationACLsManager aclsManager,
         LocalDirsHandlerService dirsHandler) {
       return new ContainerManagerImpl(context, exec, del, nodeStatusUpdater,
-        metrics, aclsManager, dirsHandler){
+        metrics, dirsHandler){
         @Override
         public void setBlockNewContainerRequests(
             boolean blockNewContainerRequests) {
@@ -592,7 +593,7 @@ public class TestNodeManagerResync {
     ApplicationId applicationId = ApplicationId.newInstance(0, 1);
     ApplicationAttemptId applicationAttemptId =
         ApplicationAttemptId.newInstance(applicationId, 1);
-    ContainerId containerId = ContainerId.newInstance(applicationAttemptId, id);
+    ContainerId containerId = ContainerId.newContainerId(applicationAttemptId, id);
     NMContainerStatus containerReport =
         NMContainerStatus.newInstance(containerId, containerState,
           Resource.newInstance(1024, 1), "recover container", 0,

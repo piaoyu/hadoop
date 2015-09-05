@@ -17,30 +17,23 @@
  */
 package org.apache.hadoop.tracing;
 
-import java.io.BufferedReader;
-import java.io.DataInputStream;
-import java.io.File;
-import java.io.FileInputStream;
 import java.io.IOException;
-import java.io.InputStreamReader;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
-import java.util.UUID;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.io.IOUtils;
 import org.apache.hadoop.tracing.SpanReceiverInfo.ConfigurationPair;
-import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.hadoop.util.ShutdownHookManager;
-import org.htrace.HTraceConfiguration;
-import org.htrace.SpanReceiver;
-import org.htrace.Trace;
+import org.apache.htrace.SpanReceiver;
+import org.apache.htrace.SpanReceiverBuilder;
+import org.apache.htrace.Trace;
+import org.apache.htrace.impl.LocalFileSpanReceiver;
 
 /**
  * This class provides functions for reading the names of SpanReceivers from
@@ -50,67 +43,43 @@ import org.htrace.Trace;
  */
 @InterfaceAudience.Private
 public class SpanReceiverHost implements TraceAdminProtocol {
-  public static final String SPAN_RECEIVERS_CONF_KEY =
-    "hadoop.htrace.spanreceiver.classes";
+  public static final String SPAN_RECEIVERS_CONF_SUFFIX =
+      "spanreceiver.classes";
   private static final Log LOG = LogFactory.getLog(SpanReceiverHost.class);
+  private static final HashMap<String, SpanReceiverHost> hosts =
+      new HashMap<String, SpanReceiverHost>(1);
   private final TreeMap<Long, SpanReceiver> receivers =
       new TreeMap<Long, SpanReceiver>();
+  private final String confPrefix;
   private Configuration config;
   private boolean closed = false;
   private long highestId = 1;
 
-  private final static String LOCAL_FILE_SPAN_RECEIVER_PATH =
-      "hadoop.htrace.local-file-span-receiver.path";
+  private final static String LOCAL_FILE_SPAN_RECEIVER_PATH_SUFFIX =
+      "local-file-span-receiver.path";
 
-  private static enum SingletonHolder {
-    INSTANCE;
-    Object lock = new Object();
-    SpanReceiverHost host = null;
-  }
-
-  public static SpanReceiverHost getInstance(Configuration conf) {
-    if (SingletonHolder.INSTANCE.host != null) {
-      return SingletonHolder.INSTANCE.host;
-    }
-    synchronized (SingletonHolder.INSTANCE.lock) {
-      if (SingletonHolder.INSTANCE.host != null) {
-        return SingletonHolder.INSTANCE.host;
+  public static SpanReceiverHost get(Configuration conf, String confPrefix) {
+    synchronized (SpanReceiverHost.class) {
+      SpanReceiverHost host = hosts.get(confPrefix);
+      if (host != null) {
+        return host;
       }
-      SpanReceiverHost host = new SpanReceiverHost();
-      host.loadSpanReceivers(conf);
-      SingletonHolder.INSTANCE.host = host;
+      final SpanReceiverHost newHost = new SpanReceiverHost(confPrefix);
+      newHost.loadSpanReceivers(conf);
       ShutdownHookManager.get().addShutdownHook(new Runnable() {
           public void run() {
-            SingletonHolder.INSTANCE.host.closeReceivers();
+            newHost.closeReceivers();
           }
         }, 0);
-      return SingletonHolder.INSTANCE.host;
+      hosts.put(confPrefix, newHost);
+      return newHost;
     }
   }
 
   private static List<ConfigurationPair> EMPTY = Collections.emptyList();
 
-  private static String getUniqueLocalTraceFileName() {
-    String tmp = System.getProperty("java.io.tmpdir", "/tmp");
-    String nonce = null;
-    BufferedReader reader = null;
-    try {
-      // On Linux we can get a unique local file name by reading the process id
-      // out of /proc/self/stat.  (There isn't any portable way to get the
-      // process ID from Java.)
-      reader = new BufferedReader(
-          new InputStreamReader(new FileInputStream("/proc/self/stat")));
-      String line = reader.readLine();
-      nonce = line.split(" ")[0];
-    } catch (IOException e) {
-    } finally {
-      IOUtils.cleanup(LOG, reader);
-    }
-    if (nonce == null) {
-      // If we can't use the process ID, use a random nonce.
-      nonce = UUID.randomUUID().toString();
-    }
-    return new File(tmp, nonce).getAbsolutePath();
+  private SpanReceiverHost(String confPrefix) {
+    this.confPrefix = confPrefix;
   }
 
   /**
@@ -125,23 +94,30 @@ public class SpanReceiverHost implements TraceAdminProtocol {
    */
   public synchronized void loadSpanReceivers(Configuration conf) {
     config = new Configuration(conf);
-    String[] receiverNames =
-        config.getTrimmedStrings(SPAN_RECEIVERS_CONF_KEY);
+    String receiverKey = confPrefix + SPAN_RECEIVERS_CONF_SUFFIX;
+    String[] receiverNames = config.getTrimmedStrings(receiverKey);
     if (receiverNames == null || receiverNames.length == 0) {
+      if (LOG.isTraceEnabled()) {
+        LOG.trace("No span receiver names found in " + receiverKey + ".");
+      }
       return;
     }
     // It's convenient to have each daemon log to a random trace file when
     // testing.
-    if (config.get(LOCAL_FILE_SPAN_RECEIVER_PATH) == null) {
-      config.set(LOCAL_FILE_SPAN_RECEIVER_PATH,
-          getUniqueLocalTraceFileName());
+    String pathKey = confPrefix + LOCAL_FILE_SPAN_RECEIVER_PATH_SUFFIX;
+    if (config.get(pathKey) == null) {
+      String uniqueFile = LocalFileSpanReceiver.getUniqueLocalTraceFileName();
+      config.set(pathKey, uniqueFile);
+      if (LOG.isTraceEnabled()) {
+        LOG.trace("Set " + pathKey + " to " + uniqueFile);
+      }
     }
     for (String className : receiverNames) {
       try {
         SpanReceiver rcvr = loadInstance(className, EMPTY);
         Trace.addReceiver(rcvr);
         receivers.put(highestId++, rcvr);
-        LOG.info("SpanReceiver " + className + " was loaded successfully.");
+        LOG.info("Loaded SpanReceiver " + className + " successfully.");
       } catch (IOException e) {
         LOG.error("Failed to load SpanReceiver", e);
       }
@@ -150,60 +126,14 @@ public class SpanReceiverHost implements TraceAdminProtocol {
 
   private synchronized SpanReceiver loadInstance(String className,
       List<ConfigurationPair> extraConfig) throws IOException {
-    className = className.trim();
-    if (!className.contains(".")) {
-      className = "org.htrace.impl." + className;
+    SpanReceiverBuilder builder =
+        new SpanReceiverBuilder(TraceUtils.
+            wrapHadoopConf(confPrefix, config, extraConfig));
+    SpanReceiver rcvr = builder.spanReceiverClass(className.trim()).build();
+    if (rcvr == null) {
+      throw new IOException("Failed to load SpanReceiver " + className);
     }
-    Class<?> implClass = null;
-    SpanReceiver impl;
-    try {
-      implClass = Class.forName(className);
-      Object o = ReflectionUtils.newInstance(implClass, config);
-      impl = (SpanReceiver)o;
-      impl.configure(wrapHadoopConf(config, extraConfig));
-    } catch (ClassCastException e) {
-      throw new IOException("Class " + className +
-          " does not implement SpanReceiver.");
-    } catch (ClassNotFoundException e) {
-      throw new IOException("Class " + className + " cannot be found.");
-    } catch (SecurityException e) {
-      throw new IOException("Got SecurityException while loading " +
-          "SpanReceiver " + className);
-    } catch (IllegalArgumentException e) {
-      throw new IOException("Got IllegalArgumentException while loading " +
-          "SpanReceiver " + className, e);
-    } catch (RuntimeException e) {
-      throw new IOException("Got RuntimeException while loading " +
-          "SpanReceiver " + className, e);
-    }
-    return impl;
-  }
-
-  private static HTraceConfiguration wrapHadoopConf(final Configuration conf,
-          List<ConfigurationPair> extraConfig) {
-    final HashMap<String, String> extraMap = new HashMap<String, String>();
-    for (ConfigurationPair pair : extraConfig) {
-      extraMap.put(pair.getKey(), pair.getValue());
-    }
-    return new HTraceConfiguration() {
-      public static final String HTRACE_CONF_PREFIX = "hadoop.htrace.";
-
-      @Override
-      public String get(String key) {
-        if (extraMap.containsKey(key)) {
-          return extraMap.get(key);
-        }
-        return conf.get(HTRACE_CONF_PREFIX + key);
-      }
-
-      @Override
-      public String get(String key, String defaultValue) {
-        if (extraMap.containsKey(key)) {
-          return extraMap.get(key);
-        }
-        return conf.get(HTRACE_CONF_PREFIX + key, defaultValue);
-      }
-    };
+    return rcvr;
   }
 
   /**
@@ -224,7 +154,7 @@ public class SpanReceiverHost implements TraceAdminProtocol {
 
   public synchronized SpanReceiverInfo[] listSpanReceivers()
       throws IOException {
-    SpanReceiverInfo info[] = new SpanReceiverInfo[receivers.size()];
+    SpanReceiverInfo[] info = new SpanReceiverInfo[receivers.size()];
     int i = 0;
 
     for(Map.Entry<Long, SpanReceiver> entry : receivers.entrySet()) {

@@ -35,8 +35,6 @@ import org.slf4j.LoggerFactory;
  */
 public class PlanQueue extends ParentQueue {
 
-  public static final String DEFAULT_QUEUE_SUFFIX = "-default";
-
   private static final Logger LOG = LoggerFactory.getLogger(PlanQueue.class);
 
   private int maxAppsForReservation;
@@ -47,7 +45,7 @@ public class PlanQueue extends ParentQueue {
   private boolean showReservationsAsQueues;
 
   public PlanQueue(CapacitySchedulerContext cs, String queueName,
-      CSQueue parent, CSQueue old) {
+      CSQueue parent, CSQueue old) throws IOException {
     super(cs, queueName, parent, old);
 
     this.schedulerContext = cs;
@@ -99,12 +97,7 @@ public class PlanQueue extends ParentQueue {
     }
 
     // Set new configs
-    setupQueueConfigs(clusterResource, newlyParsedParentQueue.getCapacity(),
-        newlyParsedParentQueue.getAbsoluteCapacity(),
-        newlyParsedParentQueue.getMaximumCapacity(),
-        newlyParsedParentQueue.getAbsoluteMaximumCapacity(),
-        newlyParsedParentQueue.getState(), newlyParsedParentQueue.getACLs(),
-        newlyParsedParentQueue.getReservationContinueLooking());
+    setupQueueConfigs(clusterResource);
 
     updateQuotas(newlyParsedParentQueue.userLimit,
         newlyParsedParentQueue.userLimitFactor,

@@ -34,7 +34,7 @@ import org.apache.hadoop.hdfs.protocol.CacheDirectiveInfo;
 import org.apache.hadoop.hdfs.protocol.CachePoolInfo;
 import org.apache.hadoop.hdfs.protocol.LayoutVersion;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfo;
-import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfoUnderConstruction;
+import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfoContiguous;
 import org.apache.hadoop.hdfs.server.common.HdfsServerConstants.BlockUCState;
 import org.apache.hadoop.hdfs.server.namenode.snapshot.SnapshotFSImageFormat;
 import org.apache.hadoop.hdfs.server.namenode.snapshot.SnapshotFSImageFormat.ReferenceMap;
@@ -120,7 +120,7 @@ public class FSImageSerialization {
     byte[] name = readBytes(in);
     long inodeId = NameNodeLayoutVersion.supports(
         LayoutVersion.Feature.ADD_INODE_ID, imgVersion) ? in.readLong()
-        : fsNamesys.allocateNewInodeId();
+        : fsNamesys.dir.allocateNewInodeId();
     short blockReplication = in.readShort();
     long modificationTime = in.readLong();
     long preferredBlockSize = in.readLong();
@@ -131,13 +131,14 @@ public class FSImageSerialization {
     int i = 0;
     for (; i < numBlocks-1; i++) {
       blk.readFields(in);
-      blocks[i] = new BlockInfo(blk, blockReplication);
+      blocks[i] = new BlockInfoContiguous(blk, blockReplication);
     }
     // last block is UNDER_CONSTRUCTION
     if(numBlocks > 0) {
       blk.readFields(in);
-      blocks[i] = new BlockInfoUnderConstruction(
-        blk, blockReplication, BlockUCState.UNDER_CONSTRUCTION, null);
+      blocks[i] = new BlockInfoContiguous(blk, blockReplication);
+      blocks[i].convertToBlockUnderConstruction(BlockUCState.UNDER_CONSTRUCTION,
+          null);
     }
     PermissionStatus perm = PermissionStatus.read(in);
     String clientName = readString(in);
@@ -179,9 +180,9 @@ public class FSImageSerialization {
 
   /**
    * Serialize a {@link INodeFile} node
-   * @param node The node to write
+   * @param file The INodeFile to write
    * @param out The {@link DataOutputStream} where the fields are written
-   * @param writeBlock Whether to write block information
+   * @param writeUnderConstruction Whether to write under construction information
    */
   public static void writeINodeFile(INodeFile file, DataOutput out,
       boolean writeUnderConstruction) throws IOException {
@@ -221,10 +222,10 @@ public class FSImageSerialization {
     out.writeLong(file.getPreferredBlockSize());
   }
 
-  private static void writeQuota(Quota.Counts quota, DataOutput out)
+  private static void writeQuota(QuotaCounts quota, DataOutput out)
       throws IOException {
-    out.writeLong(quota.get(Quota.NAMESPACE));
-    out.writeLong(quota.get(Quota.DISKSPACE));
+    out.writeLong(quota.getNameSpace());
+    out.writeLong(quota.getStorageSpace());
   }
 
   /**

@@ -33,7 +33,6 @@ import org.apache.hadoop.registry.client.exceptions.NoRecordException;
 import org.apache.hadoop.registry.client.impl.zk.RegistryInternalConstants;
 import org.apache.hadoop.registry.client.types.RegistryPathStatus;
 import org.apache.hadoop.registry.client.types.ServiceRecord;
-import org.apache.hadoop.registry.client.types.ServiceRecordHeader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -44,6 +43,7 @@ import java.io.IOException;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -58,21 +58,47 @@ public class RegistryUtils {
   /**
    * Buld the user path -switches to the system path if the user is "".
    * It also cross-converts the username to ascii via punycode
-   * @param shortname username or ""
+   * @param username username or ""
    * @return the path to the user
    */
-  public static String homePathForUser(String shortname) {
-    Preconditions.checkArgument(shortname != null, "null user");
+  public static String homePathForUser(String username) {
+    Preconditions.checkArgument(username != null, "null user");
 
     // catch recursion
-    if (shortname.startsWith(RegistryConstants.PATH_USERS)) {
-      return shortname;
+    if (username.startsWith(RegistryConstants.PATH_USERS)) {
+      return username;
     }
-    if (shortname.isEmpty()) {
+    if (username.isEmpty()) {
       return RegistryConstants.PATH_SYSTEM_SERVICES;
     }
+
+    // convert username to registry name
+    String convertedName = convertUsername(username);
+
     return RegistryPathUtils.join(RegistryConstants.PATH_USERS,
-        encodeForRegistry(shortname));
+        encodeForRegistry(convertedName));
+  }
+
+  /**
+   * Convert the username to that which can be used for registry
+   * entries. Lower cases it,
+   * Strip the kerberos realm off a username if needed, and any "/" hostname
+   * entries
+   * @param username user
+   * @return the converted username
+   */
+  public static String convertUsername(String username) {
+    String converted =
+        org.apache.hadoop.util.StringUtils.toLowerCase(username);
+    int atSymbol = converted.indexOf('@');
+    if (atSymbol > 0) {
+      converted = converted.substring(0, atSymbol);
+    }
+    int slashSymbol = converted.indexOf('/');
+    if (slashSymbol > 0) {
+      converted = converted.substring(0, slashSymbol);
+    }
+    return converted;
   }
 
   /**
@@ -90,10 +116,10 @@ public class RegistryUtils {
   }
 
   /**
-   * Create a path to a service under a user & service class
+   * Create a path to a service under a user and service class
    * @param user username or ""
    * @param serviceClass service name
-   * @param serviceName service name unique for that user & service class
+   * @param serviceName service name unique for that user and service class
    * @return a full path
    */
   public static String servicePath(String user,
@@ -109,7 +135,7 @@ public class RegistryUtils {
    * Create a path for listing components under a service
    * @param user username or ""
    * @param serviceClass service name
-   * @param serviceName service name unique for that user & service class
+   * @param serviceName service name unique for that user and service class
    * @return a full path
    */
   public static String componentListPath(String user,
@@ -123,7 +149,7 @@ public class RegistryUtils {
    * Create the path to a service record for a component
    * @param user username or ""
    * @param serviceClass service name
-   * @param serviceName service name unique for that user & service class
+   * @param serviceName service name unique for that user and service class
    * @param componentName unique name/ID of the component
    * @return a full path
    */
@@ -288,7 +314,7 @@ public class RegistryUtils {
       Collection<RegistryPathStatus> stats) throws IOException {
     Map<String, ServiceRecord> results = new HashMap<String, ServiceRecord>(stats.size());
     for (RegistryPathStatus stat : stats) {
-      if (stat.size > ServiceRecordHeader.getLength()) {
+      if (stat.size > ServiceRecord.RECORD_TYPE.length()) {
         // maybe has data
         String path = join(parentpath, stat.path);
         try {
@@ -318,7 +344,6 @@ public class RegistryUtils {
    * <p>
    * @param operations operation support for fetches
    * @param parentpath path of the parent of all the entries
-   * @param stats a map of name:value mappings.
    * @return a possibly empty map of fullpath:record.
    * @throws IOException for any IO Operation that wasn't ignored.
    */
@@ -336,7 +361,6 @@ public class RegistryUtils {
    * <p>
    * @param operations operation support for fetches
    * @param parentpath path of the parent of all the entries
-   * @param stats a map of name:value mappings.
    * @return a possibly empty map of fullpath:record.
    * @throws IOException for any IO Operation that wasn't ignored.
    */
@@ -356,7 +380,7 @@ public class RegistryUtils {
    */
   public static class ServiceRecordMarshal extends JsonSerDeser<ServiceRecord> {
     public ServiceRecordMarshal() {
-      super(ServiceRecord.class, ServiceRecordHeader.getData());
+      super(ServiceRecord.class);
     }
   }
 }

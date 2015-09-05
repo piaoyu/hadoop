@@ -22,6 +22,8 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.InputStream;
+import java.io.InterruptedIOException;
+import java.nio.charset.Charset;
 import java.util.Arrays;
 import java.util.Map;
 import java.util.Timer;
@@ -210,19 +212,26 @@ abstract public class Shell {
   public static String[] getCheckProcessIsAliveCommand(String pid) {
     return Shell.WINDOWS ?
       new String[] { Shell.WINUTILS, "task", "isAlive", pid } :
-      new String[] { "kill", "-0", isSetsidAvailable ? "-" + pid : pid };
+      isSetsidAvailable ?
+        new String[] { "kill", "-0", "--", "-" + pid } :
+        new String[] { "kill", "-0", pid };
   }
 
   /** Return a command to send a signal to a given pid */
   public static String[] getSignalKillCommand(int code, String pid) {
-    return Shell.WINDOWS ? new String[] { Shell.WINUTILS, "task", "kill", pid } :
-      new String[] { "kill", "-" + code, isSetsidAvailable ? "-" + pid : pid };
+    return Shell.WINDOWS ?
+      new String[] { Shell.WINUTILS, "task", "kill", pid } :
+      isSetsidAvailable ?
+        new String[] { "kill", "-" + code, "--", "-" + pid } :
+        new String[] { "kill", "-" + code, pid };
   }
 
+  public static final String ENV_NAME_REGEX = "[A-Za-z_][A-Za-z0-9_]*";
   /** Return a regular expression string that match environment variables */
   public static String getEnvironmentVariableRegex() {
-    return (WINDOWS) ? "%([A-Za-z_][A-Za-z0-9_]*?)%" :
-      "\\$([A-Za-z_][A-Za-z0-9_]*)";
+    return (WINDOWS)
+        ? "%(" + ENV_NAME_REGEX + "?)%"
+        : "\\$(" + ENV_NAME_REGEX + ")";
   }
   
   /**
@@ -391,7 +400,16 @@ abstract public class Shell {
     } catch (IOException ioe) {
       LOG.debug("setsid is not available on this machine. So not using it.");
       setsidSupported = false;
-    } finally { // handle the exit code
+    }  catch (Error err) {
+      if (err.getMessage().contains("posix_spawn is not " +
+          "a supported process launch mechanism")
+          && (Shell.FREEBSD || Shell.MAC)) {
+        // HADOOP-11924: This is a workaround to avoid failure of class init
+        // by JDK issue on TR locale(JDK-8047340).
+        LOG.info("Avoiding JDK-8047340 on BSD-based systems.", err);
+        setsidSupported = false;
+      }
+    }  finally { // handle the exit code
       if (LOG.isDebugEnabled()) {
         LOG.debug("setsid exited with exit code "
                  + (shexec != null ? shexec.getExitCode() : "(null executor)"));
@@ -449,7 +467,7 @@ abstract public class Shell {
 
   /** check to see if a command needs to be executed and execute if needed */
   protected void run() throws IOException {
-    if (lastTime + interval > Time.now())
+    if (lastTime + interval > Time.monotonicNow())
       return;
     exitCode = 0; // reset for next run
     runCommand();
@@ -493,11 +511,11 @@ abstract public class Shell {
       timeOutTimer.schedule(timeoutTimerTask, timeOutInterval);
     }
     final BufferedReader errReader = 
-            new BufferedReader(new InputStreamReader(process
-                                                     .getErrorStream()));
+            new BufferedReader(new InputStreamReader(
+                process.getErrorStream(), Charset.defaultCharset()));
     BufferedReader inReader = 
-            new BufferedReader(new InputStreamReader(process
-                                                     .getInputStream()));
+            new BufferedReader(new InputStreamReader(
+                process.getInputStream(), Charset.defaultCharset()));
     final StringBuffer errMsg = new StringBuffer();
     
     // read error and input streams as this would free up the buffers
@@ -544,7 +562,9 @@ abstract public class Shell {
         throw new ExitCodeException(exitCode, errMsg.toString());
       }
     } catch (InterruptedException ie) {
-      throw new IOException(ie.toString());
+      InterruptedIOException iie = new InterruptedIOException(ie.toString());
+      iie.initCause(ie);
+      throw iie;
     } finally {
       if (timeOutTimer != null) {
         timeOutTimer.cancel();
@@ -578,7 +598,7 @@ abstract public class Shell {
         LOG.warn("Error while closing the error stream", ioe);
       }
       process.destroy();
-      lastTime = Time.now();
+      lastTime = Time.monotonicNow();
     }
   }
 
@@ -649,6 +669,18 @@ abstract public class Shell {
     }
   }
   
+  public interface CommandExecutor {
+
+    void execute() throws IOException;
+
+    int getExitCode() throws IOException;
+
+    String getOutput() throws IOException;
+
+    void close();
+    
+  }
+  
   /**
    * A simple shell command executor.
    * 
@@ -657,7 +689,8 @@ abstract public class Shell {
    * directory and the environment remains unchanged. The output of the command 
    * is stored as-is and is expected to be small.
    */
-  public static class ShellCommandExecutor extends Shell {
+  public static class ShellCommandExecutor extends Shell 
+      implements CommandExecutor {
     
     private String[] command;
     private StringBuffer output;
@@ -748,6 +781,10 @@ abstract public class Shell {
         builder.append(' ');
       }
       return builder.toString();
+    }
+
+    @Override
+    public void close() {
     }
   }
   

@@ -31,8 +31,8 @@ import org.apache.hadoop.fs.permission.AclEntryScope;
 import org.apache.hadoop.fs.permission.AclEntryType;
 import org.apache.hadoop.fs.permission.AclStatus;
 import org.apache.hadoop.fs.permission.FsAction;
+import org.apache.hadoop.fs.StorageType;
 import org.apache.hadoop.hdfs.DFSTestUtil;
-import org.apache.hadoop.hdfs.StorageType;
 import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.protocol.DatanodeID;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
@@ -153,7 +153,7 @@ public class TestPBHelper {
   @Test
   public void testConvertDatanodeID() {
     DatanodeID dn = DFSTestUtil.getLocalDatanodeID();
-    DatanodeIDProto dnProto = PBHelper.convert(dn);
+    DatanodeIDProto dnProto = PBHelperClient.convert(dn);
     DatanodeID dn2 = PBHelper.convert(dnProto);
     compare(dn, dn2);
   }
@@ -332,13 +332,13 @@ public class TestPBHelper {
   @Test
   public void testConvertExtendedBlock() {
     ExtendedBlock b = getExtendedBlock();
-    ExtendedBlockProto bProto = PBHelper.convert(b);
-    ExtendedBlock b1 = PBHelper.convert(bProto);
+    ExtendedBlockProto bProto = PBHelperClient.convert(b);
+    ExtendedBlock b1 = PBHelperClient.convert(bProto);
     assertEquals(b, b1);
     
     b.setBlockId(-1);
-    bProto = PBHelper.convert(b);
-    b1 = PBHelper.convert(bProto);
+    bProto = PBHelperClient.convert(b);
+    b1 = PBHelperClient.convert(bProto);
     assertEquals(b, b1);
   }
   
@@ -398,7 +398,7 @@ public class TestPBHelper {
     Token<BlockTokenIdentifier> token = new Token<BlockTokenIdentifier>(
         "identifier".getBytes(), "password".getBytes(), new Text("kind"),
         new Text("service"));
-    TokenProto tokenProto = PBHelper.convert(token);
+    TokenProto tokenProto = PBHelperClient.convert(token);
     Token<BlockTokenIdentifier> token2 = PBHelper.convert(tokenProto);
     compare(token, token2);
   }
@@ -478,10 +478,11 @@ public class TestPBHelper {
                                          AdminStates.NORMAL)
     };
     LocatedBlock lb = new LocatedBlock(
-        new ExtendedBlock("bp12", 12345, 10, 53), dnInfos, 5, false);
+        new ExtendedBlock("bp12", 12345, 10, 53), dnInfos);
     lb.setBlockToken(new Token<BlockTokenIdentifier>(
         "identifier".getBytes(), "password".getBytes(), new Text("kind"),
         new Text("service")));
+    lb.setStartOffset(5);
     return lb;
   }
 
@@ -591,16 +592,16 @@ public class TestPBHelper {
   @Test
   public void testChecksumTypeProto() {
     assertEquals(DataChecksum.Type.NULL,
-        PBHelper.convert(HdfsProtos.ChecksumTypeProto.CHECKSUM_NULL));
+        PBHelperClient.convert(HdfsProtos.ChecksumTypeProto.CHECKSUM_NULL));
     assertEquals(DataChecksum.Type.CRC32,
-        PBHelper.convert(HdfsProtos.ChecksumTypeProto.CHECKSUM_CRC32));
+        PBHelperClient.convert(HdfsProtos.ChecksumTypeProto.CHECKSUM_CRC32));
     assertEquals(DataChecksum.Type.CRC32C,
-        PBHelper.convert(HdfsProtos.ChecksumTypeProto.CHECKSUM_CRC32C));
-    assertEquals(PBHelper.convert(DataChecksum.Type.NULL),
+        PBHelperClient.convert(HdfsProtos.ChecksumTypeProto.CHECKSUM_CRC32C));
+    assertEquals(PBHelperClient.convert(DataChecksum.Type.NULL),
         HdfsProtos.ChecksumTypeProto.CHECKSUM_NULL);
-    assertEquals(PBHelper.convert(DataChecksum.Type.CRC32),
+    assertEquals(PBHelperClient.convert(DataChecksum.Type.CRC32),
         HdfsProtos.ChecksumTypeProto.CHECKSUM_CRC32);
-    assertEquals(PBHelper.convert(DataChecksum.Type.CRC32C),
+    assertEquals(PBHelperClient.convert(DataChecksum.Type.CRC32C),
         HdfsProtos.ChecksumTypeProto.CHECKSUM_CRC32C);
   }
 

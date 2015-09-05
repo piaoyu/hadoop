@@ -25,6 +25,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.nio.charset.Charset;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
@@ -73,19 +74,17 @@ import org.codehaus.jackson.map.JsonMappingException;
 import org.codehaus.jackson.map.ObjectMapper;
 
 import com.google.common.annotations.VisibleForTesting;
-import com.microsoft.windowsazure.storage.AccessCondition;
-import com.microsoft.windowsazure.storage.OperationContext;
-import com.microsoft.windowsazure.storage.StorageException;
-import com.microsoft.windowsazure.storage.blob.CloudBlob;
-import com.microsoft.windowsazure.storage.core.*;
+import com.microsoft.azure.storage.AccessCondition;
+import com.microsoft.azure.storage.OperationContext;
+import com.microsoft.azure.storage.StorageException;
+import com.microsoft.azure.storage.blob.CloudBlob;
+import com.microsoft.azure.storage.core.*;
 
 /**
- * <p>
  * A {@link FileSystem} for reading and writing files stored on <a
  * href="http://store.azure.com/">Windows Azure</a>. This implementation is
  * blob-based and stores files on Azure in their native form so they can be read
  * by other Azure tools.
- * </p>
  */
 @InterfaceAudience.Public
 @InterfaceStability.Stable
@@ -153,7 +152,7 @@ public class NativeAzureFileSystem extends FileSystem {
             "Error reading pending rename file contents -- "
                 + "maximum file size exceeded");
       }
-      String contents = new String(bytes, 0, l);
+      String contents = new String(bytes, 0, l, Charset.forName("UTF-8"));
 
       // parse the JSON
       ObjectMapper objMapper = new ObjectMapper();
@@ -217,9 +216,11 @@ public class NativeAzureFileSystem extends FileSystem {
     }
 
     /**
-     * Write to disk the information needed to redo folder rename, in JSON format.
-     * The file name will be wasb://<sourceFolderPrefix>/folderName-RenamePending.json
+     * Write to disk the information needed to redo folder rename,
+     * in JSON format. The file name will be
+     * {@code wasb://<sourceFolderPrefix>/folderName-RenamePending.json}
      * The file format will be:
+     * <pre>{@code
      * {
      *   FormatVersion: "1.0",
      *   OperationTime: "<YYYY-MM-DD HH:MM:SS.MMM>",
@@ -238,7 +239,7 @@ public class NativeAzureFileSystem extends FileSystem {
      *    "innerFile",
      *    "innerFile2"
      *  ]
-     * }
+     * } }</pre>
      * @throws IOException
      */
     public void writeFile(FileSystem fs) throws IOException {
@@ -253,7 +254,7 @@ public class NativeAzureFileSystem extends FileSystem {
       // Write file.
       try {
         output = fs.create(path);
-        output.write(contents.getBytes());
+        output.write(contents.getBytes(Charset.forName("UTF-8")));
       } catch (IOException e) {
         throw new IOException("Unable to write RenamePending file for folder rename from "
             + srcKey + " to " + dstKey, e);
@@ -641,6 +642,8 @@ public class NativeAzureFileSystem extends FileSystem {
   static final String AZURE_OUTPUT_STREAM_BUFFER_SIZE_PROPERTY_NAME =
       "fs.azure.output.stream.buffer.size";
 
+  public static final String SKIP_AZURE_METRICS_PROPERTY_NAME = "fs.azure.skip.metrics";
+
   private class NativeAzureFsInputStream extends FSInputStream {
     private InputStream in;
     private final String key;
@@ -910,9 +913,6 @@ public class NativeAzureFileSystem extends FileSystem {
      * The create also includes the name of the original key value which is
      * stored in the m_key member variable. This method should only be called
      * when the stream is closed.
-     * 
-     * @param anEncodedKey
-     *          Encoding of the original key stored in m_key member.
      */
     private void restoreKey() throws IOException {
       store.rename(getEncodedKey(), getKey());
@@ -1035,13 +1035,15 @@ public class NativeAzureFileSystem extends FileSystem {
       store = createDefaultStore(conf);
     }
 
-    // Make sure the metrics system is available before interacting with Azure
-    AzureFileSystemMetricsSystem.fileSystemStarted();
-    metricsSourceName = newMetricsSourceName();
-    String sourceDesc = "Azure Storage Volume File System metrics";
     instrumentation = new AzureFileSystemInstrumentation(conf);
-    AzureFileSystemMetricsSystem.registerSource(metricsSourceName, sourceDesc,
+    if(!conf.getBoolean(SKIP_AZURE_METRICS_PROPERTY_NAME, false)) {
+      // Make sure the metrics system is available before interacting with Azure
+      AzureFileSystemMetricsSystem.fileSystemStarted();
+      metricsSourceName = newMetricsSourceName();
+      String sourceDesc = "Azure Storage Volume File System metrics";
+      AzureFileSystemMetricsSystem.registerSource(metricsSourceName, sourceDesc,
         instrumentation);
+    }
 
     store.initialize(uri, conf, instrumentation);
     setConf(conf);
@@ -1358,8 +1360,12 @@ public class NativeAzureFileSystem extends FileSystem {
       String parentKey = pathToKey(parentFolder);
       FileMetadata parentMetadata = store.retrieveMetadata(parentKey);
       if (parentMetadata != null && parentMetadata.isDir() &&
-          parentMetadata.getBlobMaterialization() == BlobMaterialization.Explicit) {
-        store.updateFolderLastModifiedTime(parentKey, parentFolderLease);
+        parentMetadata.getBlobMaterialization() == BlobMaterialization.Explicit) {
+        if (parentFolderLease != null) {
+          store.updateFolderLastModifiedTime(parentKey, parentFolderLease);
+        } else {
+          updateParentFolderLastModifiedTime(key);
+        }
       } else {
         // Make sure that the parent folder exists.
         // Create it using inherited permissions from the first existing directory going up the path
@@ -1498,7 +1504,7 @@ public class NativeAzureFileSystem extends FileSystem {
               createPermissionStatus(FsPermission.getDefault()));
         } else {
           if (!skipParentFolderLastModifidedTimeUpdate) {
-            store.updateFolderLastModifiedTime(parentKey, null);
+            updateParentFolderLastModifiedTime(key);
           }
         }
       }
@@ -1559,9 +1565,8 @@ public class NativeAzureFileSystem extends FileSystem {
       // Update parent directory last modified time
       Path parent = absolutePath.getParent();
       if (parent != null && parent.getParent() != null) { // not root
-        String parentKey = pathToKey(parent);
         if (!skipParentFolderLastModifidedTimeUpdate) {
-          store.updateFolderLastModifiedTime(parentKey, null);
+          updateParentFolderLastModifiedTime(key);
         }
       }
       instrumentation.directoryDeleted();
@@ -1791,7 +1796,7 @@ public class NativeAzureFileSystem extends FileSystem {
    * 
    * @param permission
    *          The permission to mask.
-   * @param applyDefaultUmask
+   * @param applyMode
    *          Whether to also apply the default umask.
    * @return The masked persmission.
    */
@@ -2035,7 +2040,37 @@ public class NativeAzureFileSystem extends FileSystem {
               createPermissionStatus(FsPermission.getDefault()));
         }
 
-        store.updateFolderLastModifiedTime(parentKey, null);
+        if (store.isAtomicRenameKey(parentKey)) {
+          SelfRenewingLease lease = null;
+          try {
+            lease = leaseSourceFolder(parentKey);
+            store.updateFolderLastModifiedTime(parentKey, lease);
+          } catch (AzureException e) {
+            String errorCode = "";
+            try {
+              StorageException e2 = (StorageException) e.getCause();
+              errorCode = e2.getErrorCode();
+            } catch (Exception e3) {
+              // do nothing if cast fails
+            }
+            if (errorCode.equals("BlobNotFound")) {
+              throw new FileNotFoundException("Folder does not exist: " + parentKey);
+            }
+            LOG.warn("Got unexpected exception trying to get lease on "
+                + parentKey + ". " + e.getMessage());
+            throw e;
+          } finally {
+            try {
+              if (lease != null) {
+                lease.free();
+              }
+            } catch (Exception e) {
+              LOG.error("Unable to free lease on " + parentKey, e);
+            }
+          }
+        } else {
+          store.updateFolderLastModifiedTime(parentKey, null);
+        }
       }
     }
   }
@@ -2207,8 +2242,10 @@ public class NativeAzureFileSystem extends FileSystem {
 
     long startTime = System.currentTimeMillis();
 
-    AzureFileSystemMetricsSystem.unregisterSource(metricsSourceName);
-    AzureFileSystemMetricsSystem.fileSystemClosed();
+    if(!getConf().getBoolean(SKIP_AZURE_METRICS_PROPERTY_NAME, false)) {
+      AzureFileSystemMetricsSystem.unregisterSource(metricsSourceName);
+      AzureFileSystemMetricsSystem.fileSystemClosed();
+    }
 
     if (LOG.isDebugEnabled()) {
         LOG.debug("Submitting metrics when file system closed took "
@@ -2372,7 +2409,6 @@ public class NativeAzureFileSystem extends FileSystem {
    * recover the original key.
    * 
    * @param aKey
-   * @param numBuckets
    * @return Encoded version of the original key.
    */
   private static String encodeKey(String aKey) {

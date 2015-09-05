@@ -26,6 +26,7 @@ import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.yarn.api.TestContainerId;
 import org.apache.hadoop.yarn.api.records.ContainerId;
 import org.apache.hadoop.yarn.api.records.URL;
+import org.apache.hadoop.yarn.api.records.NodeId;
 import org.junit.Test;
 
 public class TestConverterUtils {
@@ -85,4 +86,32 @@ public class TestConverterUtils {
   public void testContainerIdNull() throws URISyntaxException {
     assertNull(ConverterUtils.toString((ContainerId)null));
   }  
+  
+  @Test
+  public void testNodeIdWithDefaultPort() throws URISyntaxException {
+    NodeId nid;
+    
+    nid = ConverterUtils.toNodeIdWithDefaultPort("node:10");
+    assertEquals(nid.getPort(), 10);
+    assertEquals(nid.getHost(), "node");
+    
+    nid = ConverterUtils.toNodeIdWithDefaultPort("node");
+    assertEquals(nid.getPort(), 0);
+    assertEquals(nid.getHost(), "node");
+  }
+
+  @Test(expected = IllegalArgumentException.class)
+  public void testInvalidContainerId() {
+    ConverterUtils.toContainerId("container_e20_1423221031460_0003_01");
+  }
+
+  @Test(expected = IllegalArgumentException.class)
+  public void testInvalidAppattemptId() {
+    ConverterUtils.toApplicationAttemptId("appattempt_1423221031460");
+  }
+
+  @Test(expected = IllegalArgumentException.class)
+  public void testApplicationId() {
+    ConverterUtils.toApplicationId("application_1423221031460");
+  }
 }

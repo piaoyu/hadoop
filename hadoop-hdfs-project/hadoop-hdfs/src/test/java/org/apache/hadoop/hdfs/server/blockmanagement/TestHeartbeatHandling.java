@@ -23,6 +23,7 @@ import java.util.ArrayList;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
+import org.apache.hadoop.hdfs.DFSTestUtil;
 import org.apache.hadoop.hdfs.HdfsConfiguration;
 import org.apache.hadoop.hdfs.MiniDFSCluster;
 import org.apache.hadoop.hdfs.protocol.Block;
@@ -164,16 +165,17 @@ public class TestHeartbeatHandling {
           NameNodeAdapter.sendHeartBeat(nodeReg3, dd3, namesystem);
 
           // Test with all alive nodes.
-          dd1.setLastUpdate(System.currentTimeMillis());
-          dd2.setLastUpdate(System.currentTimeMillis());
-          dd3.setLastUpdate(System.currentTimeMillis());
+          DFSTestUtil.resetLastUpdatesWithOffset(dd1, 0);
+          DFSTestUtil.resetLastUpdatesWithOffset(dd2, 0);
+          DFSTestUtil.resetLastUpdatesWithOffset(dd3, 0);
           final DatanodeStorageInfo[] storages = {
               dd1.getStorageInfos()[0],
               dd2.getStorageInfos()[0],
               dd3.getStorageInfos()[0]};
-          BlockInfoUnderConstruction blockInfo = new BlockInfoUnderConstruction(
-              new Block(0, 0, GenerationStamp.LAST_RESERVED_STAMP), 3,
-              BlockUCState.UNDER_RECOVERY, storages);
+          BlockInfo blockInfo = new BlockInfoContiguous(
+              new Block(0, 0, GenerationStamp.LAST_RESERVED_STAMP), (short) 3);
+          blockInfo.convertToBlockUnderConstruction(BlockUCState.UNDER_RECOVERY,
+              storages);
           dd1.addBlockToBeRecovered(blockInfo);
           DatanodeCommand[] cmds =
               NameNodeAdapter.sendHeartBeat(nodeReg1, dd1, namesystem).getCommands();
@@ -189,13 +191,14 @@ public class TestHeartbeatHandling {
           assertEquals(recoveringNodes[2], dd3);
 
           // Test with one stale node.
-          dd1.setLastUpdate(System.currentTimeMillis());
+          DFSTestUtil.resetLastUpdatesWithOffset(dd1, 0);
           // More than the default stale interval of 30 seconds.
-          dd2.setLastUpdate(System.currentTimeMillis() - 40 * 1000);
-          dd3.setLastUpdate(System.currentTimeMillis());
-          blockInfo = new BlockInfoUnderConstruction(
-              new Block(0, 0, GenerationStamp.LAST_RESERVED_STAMP), 3,
-              BlockUCState.UNDER_RECOVERY, storages);
+          DFSTestUtil.resetLastUpdatesWithOffset(dd2, -40 * 1000);
+          DFSTestUtil.resetLastUpdatesWithOffset(dd3, 0);
+          blockInfo = new BlockInfoContiguous(
+              new Block(0, 0, GenerationStamp.LAST_RESERVED_STAMP), (short) 3);
+          blockInfo.convertToBlockUnderConstruction(BlockUCState.UNDER_RECOVERY,
+              storages);
           dd1.addBlockToBeRecovered(blockInfo);
           cmds = NameNodeAdapter.sendHeartBeat(nodeReg1, dd1, namesystem).getCommands();
           assertEquals(1, cmds.length);
@@ -210,13 +213,14 @@ public class TestHeartbeatHandling {
           assertEquals(recoveringNodes[1], dd3);
 
           // Test with all stale node.
-          dd1.setLastUpdate(System.currentTimeMillis() - 60 * 1000);
+          DFSTestUtil.resetLastUpdatesWithOffset(dd1, - 60 * 1000);
           // More than the default stale interval of 30 seconds.
-          dd2.setLastUpdate(System.currentTimeMillis() - 40 * 1000);
-          dd3.setLastUpdate(System.currentTimeMillis() - 80 * 1000);
-          blockInfo = new BlockInfoUnderConstruction(
-              new Block(0, 0, GenerationStamp.LAST_RESERVED_STAMP), 3,
-              BlockUCState.UNDER_RECOVERY, storages);
+          DFSTestUtil.resetLastUpdatesWithOffset(dd2, - 40 * 1000);
+          DFSTestUtil.resetLastUpdatesWithOffset(dd3, - 80 * 1000);
+          blockInfo = new BlockInfoContiguous(
+              new Block(0, 0, GenerationStamp.LAST_RESERVED_STAMP), (short) 3);
+          blockInfo.convertToBlockUnderConstruction(BlockUCState.UNDER_RECOVERY,
+              storages);
           dd1.addBlockToBeRecovered(blockInfo);
           cmds = NameNodeAdapter.sendHeartBeat(nodeReg1, dd1, namesystem).getCommands();
           assertEquals(1, cmds.length);

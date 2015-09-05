@@ -19,7 +19,9 @@ package org.apache.hadoop.yarn.client.cli;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
+import java.nio.charset.Charset;
 import java.text.DecimalFormat;
 import java.util.EnumSet;
 import java.util.HashSet;
@@ -34,16 +36,21 @@ import org.apache.commons.cli.Option;
 import org.apache.commons.cli.Options;
 import org.apache.hadoop.classification.InterfaceAudience.Private;
 import org.apache.hadoop.classification.InterfaceStability.Unstable;
+import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.ToolRunner;
 import org.apache.hadoop.yarn.api.records.ApplicationAttemptReport;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.ApplicationReport;
 import org.apache.hadoop.yarn.api.records.ApplicationResourceUsageReport;
 import org.apache.hadoop.yarn.api.records.ContainerReport;
+import org.apache.hadoop.yarn.api.records.Priority;
 import org.apache.hadoop.yarn.api.records.YarnApplicationState;
+import org.apache.hadoop.yarn.exceptions.ApplicationAttemptNotFoundException;
 import org.apache.hadoop.yarn.exceptions.ApplicationNotFoundException;
+import org.apache.hadoop.yarn.exceptions.ContainerNotFoundException;
 import org.apache.hadoop.yarn.exceptions.YarnException;
 import org.apache.hadoop.yarn.util.ConverterUtils;
+import org.apache.hadoop.yarn.util.Times;
 
 import com.google.common.annotations.VisibleForTesting;
 
@@ -57,7 +64,7 @@ public class ApplicationCLI extends YarnCLI {
     "%30s\t%20s\t%35s\t%35s"
       + System.getProperty("line.separator");
   private static final String CONTAINER_PATTERN = 
-    "%30s\t%20s\t%20s\t%20s\t%20s\t%35s"
+    "%30s\t%20s\t%20s\t%20s\t%20s\t%20s\t%35s"
       + System.getProperty("line.separator");
 
   private static final String APP_TYPE_CMD = "appTypes";
@@ -67,6 +74,8 @@ public class ApplicationCLI extends YarnCLI {
   public static final String APPLICATION = "application";
   public static final String APPLICATION_ATTEMPT = "applicationattempt";
   public static final String CONTAINER = "container";
+  public static final String APP_ID = "appId";
+  public static final String UPDATE_PRIORITY = "updatePriority";
 
   private boolean allAppStates;
 
@@ -111,10 +120,16 @@ public class ApplicationCLI extends YarnCLI {
       appStateOpt.setArgs(Option.UNLIMITED_VALUES);
       appStateOpt.setArgName("States");
       opts.addOption(appStateOpt);
+      opts.addOption(APP_ID, true, "Specify Application Id to be operated");
+      opts.addOption(UPDATE_PRIORITY, true,
+          "update priority of an application. ApplicationId can be"
+              + " passed using 'appId' option.");
       opts.getOption(KILL_CMD).setArgName("Application ID");
       opts.getOption(MOVE_TO_QUEUE_CMD).setArgName("Application ID");
       opts.getOption(QUEUE_CMD).setArgName("Queue Name");
       opts.getOption(STATUS_CMD).setArgName("Application ID");
+      opts.getOption(APP_ID).setArgName("Application ID");
+      opts.getOption(UPDATE_PRIORITY).setArgName("Priority");
     } else if (args.length > 0 && args[0].equalsIgnoreCase(APPLICATION_ATTEMPT)) {
       title = APPLICATION_ATTEMPT;
       opts.addOption(STATUS_CMD, true,
@@ -151,12 +166,14 @@ public class ApplicationCLI extends YarnCLI {
         return exitCode;
       }
       if (args[0].equalsIgnoreCase(APPLICATION)) {
-        printApplicationReport(cliParser.getOptionValue(STATUS_CMD));
+        exitCode = printApplicationReport(cliParser.getOptionValue(STATUS_CMD));
       } else if (args[0].equalsIgnoreCase(APPLICATION_ATTEMPT)) {
-        printApplicationAttemptReport(cliParser.getOptionValue(STATUS_CMD));
+        exitCode = printApplicationAttemptReport(cliParser
+            .getOptionValue(STATUS_CMD));
       } else if (args[0].equalsIgnoreCase(CONTAINER)) {
-        printContainerReport(cliParser.getOptionValue(STATUS_CMD));
+        exitCode = printContainerReport(cliParser.getOptionValue(STATUS_CMD));
       }
+      return exitCode;
     } else if (cliParser.hasOption(LIST_CMD)) {
       if (args[0].equalsIgnoreCase(APPLICATION)) {
         allAppStates = false;
@@ -166,7 +183,7 @@ public class ApplicationCLI extends YarnCLI {
           if (types != null) {
             for (String type : types) {
               if (!type.trim().isEmpty()) {
-                appTypes.add(type.toUpperCase().trim());
+                appTypes.add(StringUtils.toUpperCase(type).trim());
               }
             }
           }
@@ -184,8 +201,8 @@ public class ApplicationCLI extends YarnCLI {
                   break;
                 }
                 try {
-                  appStates.add(YarnApplicationState.valueOf(state
-                      .toUpperCase().trim()));
+                  appStates.add(YarnApplicationState.valueOf(
+                      StringUtils.toUpperCase(state).trim()));
                 } catch (IllegalArgumentException ex) {
                   sysout.println("The application state " + state
                       + " is invalid.");
@@ -230,6 +247,13 @@ public class ApplicationCLI extends YarnCLI {
     } else if (cliParser.hasOption(HELP_CMD)) {
       printUsage(title, opts);
       return 0;
+    } else if (cliParser.hasOption(UPDATE_PRIORITY)) {
+      if (!cliParser.hasOption(APP_ID)) {
+        printUsage(title, opts);
+        return exitCode;
+      }
+      updateApplicationPriority(cliParser.getOptionValue(APP_ID),
+          cliParser.getOptionValue(UPDATE_PRIORITY));
     } else {
       syserr.println("Invalid Command Usage : ");
       printUsage(title, opts);
@@ -251,16 +275,28 @@ public class ApplicationCLI extends YarnCLI {
    * Prints the application attempt report for an application attempt id.
    * 
    * @param applicationAttemptId
+   * @return exitCode
    * @throws YarnException
    */
-  private void printApplicationAttemptReport(String applicationAttemptId)
+  private int printApplicationAttemptReport(String applicationAttemptId)
       throws YarnException, IOException {
-    ApplicationAttemptReport appAttemptReport = client
-        .getApplicationAttemptReport(ConverterUtils
-            .toApplicationAttemptId(applicationAttemptId));
+    ApplicationAttemptReport appAttemptReport = null;
+    try {
+      appAttemptReport = client.getApplicationAttemptReport(ConverterUtils
+          .toApplicationAttemptId(applicationAttemptId));
+    } catch (ApplicationNotFoundException e) {
+      sysout.println("Application for AppAttempt with id '"
+          + applicationAttemptId + "' doesn't exist in RM or Timeline Server.");
+      return -1;
+    } catch (ApplicationAttemptNotFoundException e) {
+      sysout.println("Application Attempt with id '" + applicationAttemptId
+          + "' doesn't exist in RM or Timeline Server.");
+      return -1;
+    }
     // Use PrintWriter.println, which uses correct platform line ending.
     ByteArrayOutputStream baos = new ByteArrayOutputStream();
-    PrintWriter appAttemptReportStr = new PrintWriter(baos);
+    PrintWriter appAttemptReportStr = new PrintWriter(
+        new OutputStreamWriter(baos, Charset.forName("UTF-8")));
     if (appAttemptReport != null) {
       appAttemptReportStr.println("Application Attempt Report : ");
       appAttemptReportStr.print("\tApplicationAttempt-Id : ");
@@ -281,25 +317,46 @@ public class ApplicationCLI extends YarnCLI {
       appAttemptReportStr.print(appAttemptReport.getDiagnostics());
     } else {
       appAttemptReportStr.print("Application Attempt with id '"
-          + applicationAttemptId + "' doesn't exist in History Server.");
+          + applicationAttemptId + "' doesn't exist in Timeline Server.");
+      appAttemptReportStr.close();
+      sysout.println(baos.toString("UTF-8"));
+      return -1;
     }
     appAttemptReportStr.close();
     sysout.println(baos.toString("UTF-8"));
+    return 0;
   }
 
   /**
    * Prints the container report for an container id.
    * 
    * @param containerId
+   * @return exitCode
    * @throws YarnException
    */
-  private void printContainerReport(String containerId) throws YarnException,
+  private int printContainerReport(String containerId) throws YarnException,
       IOException {
-    ContainerReport containerReport = client.getContainerReport((ConverterUtils
-        .toContainerId(containerId)));
+    ContainerReport containerReport = null;
+    try {
+      containerReport = client.getContainerReport((ConverterUtils
+          .toContainerId(containerId)));
+    } catch (ApplicationNotFoundException e) {
+      sysout.println("Application for Container with id '" + containerId
+          + "' doesn't exist in RM or Timeline Server.");
+      return -1;
+    } catch (ApplicationAttemptNotFoundException e) {
+      sysout.println("Application Attempt for Container with id '"
+          + containerId + "' doesn't exist in RM or Timeline Server.");
+      return -1;
+    } catch (ContainerNotFoundException e) {
+      sysout.println("Container with id '" + containerId
+          + "' doesn't exist in RM or Timeline Server.");
+      return -1;
+    }
     // Use PrintWriter.println, which uses correct platform line ending.
     ByteArrayOutputStream baos = new ByteArrayOutputStream();
-    PrintWriter containerReportStr = new PrintWriter(baos);
+    PrintWriter containerReportStr = new PrintWriter(
+        new OutputStreamWriter(baos, Charset.forName("UTF-8")));
     if (containerReport != null) {
       containerReportStr.println("Container Report : ");
       containerReportStr.print("\tContainer-Id : ");
@@ -314,14 +371,21 @@ public class ApplicationCLI extends YarnCLI {
       containerReportStr.println(containerReport.getLogUrl());
       containerReportStr.print("\tHost : ");
       containerReportStr.println(containerReport.getAssignedNode());
+      containerReportStr.print("\tNodeHttpAddress : ");
+      containerReportStr.println(containerReport.getNodeHttpAddress() == null
+          ? "N/A" : containerReport.getNodeHttpAddress());
       containerReportStr.print("\tDiagnostics : ");
       containerReportStr.print(containerReport.getDiagnosticsInfo());
     } else {
       containerReportStr.print("Container with id '" + containerId
-          + "' doesn't exist in Hostory Server.");
+          + "' doesn't exist in Timeline Server.");
+      containerReportStr.close();
+      sysout.println(baos.toString("UTF-8"));
+      return -1;
     }
     containerReportStr.close();
     sysout.println(baos.toString("UTF-8"));
+    return 0;
   }
 
   /**
@@ -336,7 +400,8 @@ public class ApplicationCLI extends YarnCLI {
   private void listApplications(Set<String> appTypes,
       EnumSet<YarnApplicationState> appStates) throws YarnException,
       IOException {
-    PrintWriter writer = new PrintWriter(sysout);
+    PrintWriter writer = new PrintWriter(
+        new OutputStreamWriter(sysout, Charset.forName("UTF-8")));
     if (allAppStates) {
       for (YarnApplicationState appState : YarnApplicationState.values()) {
         appStates.add(appState);
@@ -422,15 +487,24 @@ public class ApplicationCLI extends YarnCLI {
    * Prints the application report for an application id.
    * 
    * @param applicationId
+   * @return exitCode
    * @throws YarnException
    */
-  private void printApplicationReport(String applicationId)
+  private int printApplicationReport(String applicationId)
       throws YarnException, IOException {
-    ApplicationReport appReport = client.getApplicationReport(ConverterUtils
-        .toApplicationId(applicationId));
+    ApplicationReport appReport = null;
+    try {
+      appReport = client.getApplicationReport(ConverterUtils
+          .toApplicationId(applicationId));
+    } catch (ApplicationNotFoundException e) {
+      sysout.println("Application with id '" + applicationId
+          + "' doesn't exist in RM or Timeline Server.");
+      return -1;
+    }
     // Use PrintWriter.println, which uses correct platform line ending.
     ByteArrayOutputStream baos = new ByteArrayOutputStream();
-    PrintWriter appReportStr = new PrintWriter(baos);
+    PrintWriter appReportStr = new PrintWriter(
+        new OutputStreamWriter(baos, Charset.forName("UTF-8")));
     if (appReport != null) {
       appReportStr.println("Application Report : ");
       appReportStr.print("\tApplication-Id : ");
@@ -443,6 +517,8 @@ public class ApplicationCLI extends YarnCLI {
       appReportStr.println(appReport.getUser());
       appReportStr.print("\tQueue : ");
       appReportStr.println(appReport.getQueue());
+      appReportStr.print("\tApplication Priority : ");
+      appReportStr.println(appReport.getPriority());
       appReportStr.print("\tStart-Time : ");
       appReportStr.println(appReport.getStartTime());
       appReportStr.print("\tFinish-Time : ");
@@ -472,14 +548,23 @@ public class ApplicationCLI extends YarnCLI {
       } else {
         appReportStr.println("N/A");
       }
+      appReportStr.print("\tLog Aggregation Status : ");
+      appReportStr.println(appReport.getLogAggregationStatus() == null ? "N/A"
+          : appReport.getLogAggregationStatus());
       appReportStr.print("\tDiagnostics : ");
-      appReportStr.print(appReport.getDiagnostics());
+      appReportStr.println(appReport.getDiagnostics());
+      appReportStr.print("\tUnmanaged Application : ");
+      appReportStr.print(appReport.isUnmanagedApp());
     } else {
       appReportStr.print("Application with id '" + applicationId
           + "' doesn't exist in RM.");
+      appReportStr.close();
+      sysout.println(baos.toString("UTF-8"));
+      return -1;
     }
     appReportStr.close();
     sysout.println(baos.toString("UTF-8"));
+    return 0;
   }
 
   private String getAllValidApplicationStates() {
@@ -502,7 +587,8 @@ public class ApplicationCLI extends YarnCLI {
    */
   private void listApplicationAttempts(String applicationId) throws YarnException,
       IOException {
-    PrintWriter writer = new PrintWriter(sysout);
+    PrintWriter writer = new PrintWriter(
+        new OutputStreamWriter(sysout, Charset.forName("UTF-8")));
 
     List<ApplicationAttemptReport> appAttemptsReport = client
         .getApplicationAttempts(ConverterUtils.toApplicationId(applicationId));
@@ -528,19 +614,38 @@ public class ApplicationCLI extends YarnCLI {
    */
   private void listContainers(String appAttemptId) throws YarnException,
       IOException {
-    PrintWriter writer = new PrintWriter(sysout);
+    PrintWriter writer = new PrintWriter(
+        new OutputStreamWriter(sysout, Charset.forName("UTF-8")));
 
     List<ContainerReport> appsReport = client
         .getContainers(ConverterUtils.toApplicationAttemptId(appAttemptId));
     writer.println("Total number of containers " + ":" + appsReport.size());
     writer.printf(CONTAINER_PATTERN, "Container-Id", "Start Time",
-        "Finish Time", "State", "Host", "LOG-URL");
+        "Finish Time", "State", "Host", "Node Http Address", "LOG-URL");
     for (ContainerReport containerReport : appsReport) {
-      writer.printf(CONTAINER_PATTERN, containerReport.getContainerId(),
-          containerReport.getCreationTime(), containerReport.getFinishTime(),
+      writer.printf(
+          CONTAINER_PATTERN,
+          containerReport.getContainerId(),
+          Times.format(containerReport.getCreationTime()),
+          Times.format(containerReport.getFinishTime()),      
           containerReport.getContainerState(), containerReport
-              .getAssignedNode(), containerReport.getLogUrl());
+              .getAssignedNode(), containerReport.getNodeHttpAddress() == null
+                  ? "N/A" : containerReport.getNodeHttpAddress(),
+          containerReport.getLogUrl());
     }
     writer.flush();
+  }
+
+  /**
+   * Updates priority of an application with the given ID.
+   */
+  private void updateApplicationPriority(String applicationId, String priority)
+      throws YarnException, IOException {
+    ApplicationId appId = ConverterUtils.toApplicationId(applicationId);
+    Priority newAppPriority = Priority.newInstance(Integer.parseInt(priority));
+    sysout.println("Updating priority of an aplication " + applicationId);
+    client.updateApplicationPriority(appId, newAppPriority);
+    sysout.println("Successfully updated the application with id "
+        + applicationId + " with priority '" + priority + "'");
   }
 }

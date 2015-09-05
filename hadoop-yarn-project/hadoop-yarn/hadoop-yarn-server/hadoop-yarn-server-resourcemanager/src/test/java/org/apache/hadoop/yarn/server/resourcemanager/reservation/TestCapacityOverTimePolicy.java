@@ -29,8 +29,8 @@ import org.apache.hadoop.yarn.api.records.Resource;
 import org.apache.hadoop.yarn.server.resourcemanager.reservation.exceptions.PlanningException;
 import org.apache.hadoop.yarn.server.resourcemanager.reservation.exceptions.PlanningQuotaException;
 import org.apache.hadoop.yarn.server.resourcemanager.reservation.exceptions.ResourceOverCommitException;
-import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacityScheduler;
-import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerConfiguration;
+import org.apache.hadoop.yarn.server.resourcemanager.reservation.planning.ReservationAgent;
+import org.apache.hadoop.yarn.server.resourcemanager.scheduler.QueueMetrics;
 import org.apache.hadoop.yarn.util.resource.DefaultResourceCalculator;
 import org.apache.hadoop.yarn.util.resource.ResourceCalculator;
 import org.junit.Assert;
@@ -74,18 +74,18 @@ public class TestCapacityOverTimePolicy {
 
     mAgent = mock(ReservationAgent.class);
     ReservationSystemTestUtil testUtil = new ReservationSystemTestUtil();
-    CapacityScheduler scheduler = testUtil.mockCapacityScheduler(totCont);
+    QueueMetrics rootQueueMetrics = mock(QueueMetrics.class);
     String reservationQ = testUtil.getFullReservationQueueName();
-    CapacitySchedulerConfiguration capConf = scheduler.getConfiguration();
-    capConf.setReservationWindow(reservationQ, timeWindow);
-    capConf.setInstantaneousMaxCapacity(reservationQ, instConstraint);
-    capConf.setAverageCapacity(reservationQ, avgConstraint);
+    Resource clusterResource = testUtil.calculateClusterResource(totCont);
+    ReservationSchedulerConfiguration conf =
+        ReservationSystemTestUtil.createConf(reservationQ, timeWindow,
+            instConstraint, avgConstraint);
     CapacityOverTimePolicy policy = new CapacityOverTimePolicy();
-    policy.init(reservationQ, capConf);
+    policy.init(reservationQ, conf);
 
     plan =
-        new InMemoryPlan(scheduler.getRootQueueMetrics(), policy, mAgent,
-            scheduler.getClusterResource(), step, res, minAlloc, maxAlloc,
+        new InMemoryPlan(rootQueueMetrics, policy, mAgent,
+            clusterResource, step, res, minAlloc, maxAlloc,
             "dedicated", null, true);
   }
 
@@ -197,12 +197,14 @@ public class TestCapacityOverTimePolicy {
   @Test(expected = PlanningQuotaException.class)
   public void testFailAvg() throws IOException, PlanningException {
     // generate an allocation which violates the 25% average single-shot
-    Map<ReservationInterval, ReservationRequest> req =
-        new TreeMap<ReservationInterval, ReservationRequest>();
+    Map<ReservationInterval, Resource> req =
+        new TreeMap<ReservationInterval, Resource>();
     long win = timeWindow / 2 + 100;
     int cont = (int) Math.ceil(0.5 * totCont);
     req.put(new ReservationInterval(initTime, initTime + win),
-        ReservationRequest.newInstance(Resource.newInstance(1024, 1), cont));
+        ReservationSystemUtil.toResource(
+            ReservationRequest.newInstance(Resource.newInstance(1024, 1),
+                cont)));
 
     assertTrue(plan.toString(),
         plan.addReservation(new InMemoryReservationAllocation(
@@ -213,12 +215,13 @@ public class TestCapacityOverTimePolicy {
   @Test
   public void testFailAvgBySum() throws IOException, PlanningException {
     // generate an allocation which violates the 25% average by sum
-    Map<ReservationInterval, ReservationRequest> req =
-        new TreeMap<ReservationInterval, ReservationRequest>();
+    Map<ReservationInterval, Resource> req =
+        new TreeMap<ReservationInterval, Resource>();
     long win = 86400000 / 4 + 1;
     int cont = (int) Math.ceil(0.5 * totCont);
     req.put(new ReservationInterval(initTime, initTime + win),
-        ReservationRequest.newInstance(Resource.newInstance(1024, 1), cont));
+        ReservationSystemUtil.toResource(ReservationRequest.newInstance(Resource
+            .newInstance(1024, 1), cont)));
     assertTrue(plan.toString(),
         plan.addReservation(new InMemoryReservationAllocation(
             ReservationSystemTestUtil.getNewReservationId(), null, "u1",

@@ -80,10 +80,29 @@ public interface ContractOptions {
       "rename-returns-false-if-source-missing";
 
   /**
+   * Flag to indicate that the FS remove dest first if it is an empty directory
+   * mean the FS honors POSIX rename behavior.
+   * @{value}
+   */
+  String RENAME_REMOVE_DEST_IF_EMPTY_DIR = "rename-remove-dest-if-empty-dir";
+
+  /**
    * Flag to indicate that append is supported
    * @{value}
    */
   String SUPPORTS_APPEND = "supports-append";
+
+  /**
+   * Flag to indicate that setTimes is supported.
+   * @{value}
+   */
+  String SUPPORTS_SETTIMES = "supports-settimes";
+
+  /**
+   * Flag to indicate that getFileStatus is supported.
+   * @{value}
+   */
+  String SUPPORTS_GETFILESTATUS = "supports-getfilestatus";
 
   /**
    * Flag to indicate that renames are atomic

@@ -27,7 +27,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Date;
-import java.util.Formatter;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
@@ -35,14 +35,15 @@ import java.util.Set;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.HadoopIllegalArgumentException;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.conf.Configured;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.StorageType;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.DFSUtil;
 import org.apache.hadoop.hdfs.HdfsConfiguration;
-import org.apache.hadoop.hdfs.StorageType;
 import org.apache.hadoop.hdfs.server.balancer.Dispatcher.DDatanode;
 import org.apache.hadoop.hdfs.server.balancer.Dispatcher.DDatanode.StorageGroup;
 import org.apache.hadoop.hdfs.server.balancer.Dispatcher.Source;
@@ -54,6 +55,7 @@ import org.apache.hadoop.hdfs.server.namenode.UnsupportedActionException;
 import org.apache.hadoop.hdfs.server.protocol.DatanodeStorageReport;
 import org.apache.hadoop.hdfs.server.protocol.StorageReport;
 import org.apache.hadoop.io.IOUtils;
+import org.apache.hadoop.util.HostsFileReader;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.Time;
 import org.apache.hadoop.util.Tool;
@@ -75,6 +77,10 @@ import com.google.common.base.Preconditions;
  *                     start the balancer with a default threshold of 10%
  *               bin/ start-balancer.sh -threshold 5
  *                     start the balancer with a threshold of 5%
+ *               bin/ start-balancer.sh -idleiterations 20
+ *                     start the balancer with maximum 20 consecutive idle iterations
+ *               bin/ start-balancer.sh -idleiterations -1
+ *                     run the balancer with default threshold infinitely
  * To stop:
  *      bin/ stop-balancer.sh
  * </pre>
@@ -137,7 +143,7 @@ import com.google.common.base.Preconditions;
  * <ol>
  * <li>The cluster is balanced;
  * <li>No block can be moved;
- * <li>No block has been moved for five consecutive iterations;
+ * <li>No block has been moved for specified consecutive iterations (5 by default);
  * <li>An IOException occurs while communicating with the namenode;
  * <li>Another balancer is running.
  * </ol>
@@ -148,7 +154,7 @@ import com.google.common.base.Preconditions;
  * <ol>
  * <li>The cluster is balanced. Exiting
  * <li>No block can be moved. Exiting...
- * <li>No block has been moved for 5 iterations. Exiting...
+ * <li>No block has been moved for specified iterations (5 by default). Exiting...
  * <li>Received an IO exception: failure reason. Exiting...
  * <li>Another balancer is running. Exiting...
  * </ol>
@@ -162,26 +168,36 @@ import com.google.common.base.Preconditions;
 public class Balancer {
   static final Log LOG = LogFactory.getLog(Balancer.class);
 
-  private static final Path BALANCER_ID_PATH = new Path("/system/balancer.id");
+  static final Path BALANCER_ID_PATH = new Path("/system/balancer.id");
 
-  private static final long GB = 1L << 30; //1GB
-  private static final long MAX_SIZE_TO_MOVE = 10*GB;
-
-  private static final String USAGE = "Usage: java "
-      + Balancer.class.getSimpleName()
+  private static final String USAGE = "Usage: hdfs balancer"
       + "\n\t[-policy <policy>]\tthe balancing policy: "
       + BalancingPolicy.Node.INSTANCE.getName() + " or "
       + BalancingPolicy.Pool.INSTANCE.getName()
       + "\n\t[-threshold <threshold>]\tPercentage of disk capacity"
-      + "\n\t[-exclude [-f <hosts-file> | comma-sperated list of hosts]]"
+      + "\n\t[-exclude [-f <hosts-file> | <comma-separated list of hosts>]]"
       + "\tExcludes the specified datanodes."
-      + "\n\t[-include [-f <hosts-file> | comma-sperated list of hosts]]"
-      + "\tIncludes only the specified datanodes.";
-  
+      + "\n\t[-include [-f <hosts-file> | <comma-separated list of hosts>]]"
+      + "\tIncludes only the specified datanodes."
+      + "\n\t[-blockpools <comma-separated list of blockpool ids>]"
+      + "\tThe balancer will only run on blockpools included in this list."
+      + "\n\t[-idleiterations <idleiterations>]"
+      + "\tNumber of consecutive idle iterations (-1 for Infinite) before "
+      + "exit."
+      + "\n\t[-runDuringUpgrade]"
+      + "\tWhether to run the balancer during an ongoing HDFS upgrade."
+      + "This is usually not desired since it will not affect used space "
+      + "on over-utilized machines.";
+
   private final Dispatcher dispatcher;
+  private final NameNodeConnector nnc;
   private final BalancingPolicy policy;
+  private final Set<String> sourceNodes;
+  private final boolean runDuringUpgrade;
   private final double threshold;
-  
+  private final long maxSizeToMove;
+  private final long defaultBlockSize;
+
   // all data node lists
   private final Collection<Source> overUtilized = new LinkedList<Source>();
   private final Collection<Source> aboveAvgUtilized = new LinkedList<Source>();
@@ -202,6 +218,24 @@ public class Balancer {
     }
   }
 
+  static long getLong(Configuration conf, String key, long defaultValue) {
+    final long v = conf.getLong(key, defaultValue);
+    LOG.info(key + " = " + v + " (default=" + defaultValue + ")");
+    if (v <= 0) {
+      throw new HadoopIllegalArgumentException(key + " = " + v  + " <= " + 0);
+    }
+    return v;
+  }
+
+  static int getInt(Configuration conf, String key, int defaultValue) {
+    final int v = conf.getInt(key, defaultValue);
+    LOG.info(key + " = " + v + " (default=" + defaultValue + ")");
+    if (v <= 0) {
+      throw new HadoopIllegalArgumentException(key + " = " + v  + " <= " + 0);
+    }
+    return v;
+  }
+
   /**
    * Construct a balancer.
    * Initialize balancer. It sets the value of the threshold, and 
@@ -210,24 +244,41 @@ public class Balancer {
    * when connection fails.
    */
   Balancer(NameNodeConnector theblockpool, Parameters p, Configuration conf) {
-    final long movedWinWidth = conf.getLong(
+    final long movedWinWidth = getLong(conf,
         DFSConfigKeys.DFS_BALANCER_MOVEDWINWIDTH_KEY,
         DFSConfigKeys.DFS_BALANCER_MOVEDWINWIDTH_DEFAULT);
-    final int moverThreads = conf.getInt(
+    final int moverThreads = getInt(conf,
         DFSConfigKeys.DFS_BALANCER_MOVERTHREADS_KEY,
         DFSConfigKeys.DFS_BALANCER_MOVERTHREADS_DEFAULT);
-    final int dispatcherThreads = conf.getInt(
+    final int dispatcherThreads = getInt(conf,
         DFSConfigKeys.DFS_BALANCER_DISPATCHERTHREADS_KEY,
         DFSConfigKeys.DFS_BALANCER_DISPATCHERTHREADS_DEFAULT);
-    final int maxConcurrentMovesPerNode = conf.getInt(
+    final int maxConcurrentMovesPerNode = getInt(conf,
         DFSConfigKeys.DFS_DATANODE_BALANCE_MAX_NUM_CONCURRENT_MOVES_KEY,
         DFSConfigKeys.DFS_DATANODE_BALANCE_MAX_NUM_CONCURRENT_MOVES_DEFAULT);
 
-    this.dispatcher = new Dispatcher(theblockpool, p.nodesToBeIncluded,
-        p.nodesToBeExcluded, movedWinWidth, moverThreads, dispatcherThreads,
-        maxConcurrentMovesPerNode, conf);
+    final long getBlocksSize = getLong(conf,
+        DFSConfigKeys.DFS_BALANCER_GETBLOCKS_SIZE_KEY,
+        DFSConfigKeys.DFS_BALANCER_GETBLOCKS_SIZE_DEFAULT);
+    final long getBlocksMinBlockSize = getLong(conf,
+        DFSConfigKeys.DFS_BALANCER_GETBLOCKS_MIN_BLOCK_SIZE_KEY,
+        DFSConfigKeys.DFS_BALANCER_GETBLOCKS_MIN_BLOCK_SIZE_DEFAULT);
+
+    this.nnc = theblockpool;
+    this.dispatcher = new Dispatcher(theblockpool, p.includedNodes,
+        p.excludedNodes, movedWinWidth, moverThreads, dispatcherThreads,
+        maxConcurrentMovesPerNode, getBlocksSize, getBlocksMinBlockSize, conf);
     this.threshold = p.threshold;
     this.policy = p.policy;
+    this.sourceNodes = p.sourceNodes;
+    this.runDuringUpgrade = p.runDuringUpgrade;
+
+    this.maxSizeToMove = getLong(conf,
+        DFSConfigKeys.DFS_BALANCER_MAX_SIZE_TO_MOVE_KEY,
+        DFSConfigKeys.DFS_BALANCER_MAX_SIZE_TO_MOVE_DEFAULT);
+    this.defaultBlockSize = getLong(conf,
+        DFSConfigKeys.DFS_BLOCK_SIZE_KEY,
+        DFSConfigKeys.DFS_BLOCK_SIZE_DEFAULT);
   }
   
   private static long getCapacity(DatanodeStorageReport report, StorageType t) {
@@ -240,11 +291,13 @@ public class Balancer {
     return capacity;
   }
 
-  private static long getRemaining(DatanodeStorageReport report, StorageType t) {
+  private long getRemaining(DatanodeStorageReport report, StorageType t) {
     long remaining = 0L;
     for(StorageReport r : report.getStorageReports()) {
       if (r.getStorage().getStorageType() == t) {
-        remaining += r.getRemaining();
+        if (r.getRemaining() >= defaultBlockSize) {
+          remaining += r.getRemaining();
+        }
       }
     }
     return remaining;
@@ -271,17 +324,26 @@ public class Balancer {
     long overLoadedBytes = 0L, underLoadedBytes = 0L;
     for(DatanodeStorageReport r : reports) {
       final DDatanode dn = dispatcher.newDatanode(r.getDatanodeInfo());
+      final boolean isSource = Util.isIncluded(sourceNodes, dn.getDatanodeInfo());
       for(StorageType t : StorageType.getMovableTypes()) {
         final Double utilization = policy.getUtilization(r, t);
         if (utilization == null) { // datanode does not have such storage type 
           continue;
         }
         
+        final double average = policy.getAvgUtilization(t);
+        if (utilization >= average && !isSource) {
+          LOG.info(dn + "[" + t + "] has utilization=" + utilization
+              + " >= average=" + average
+              + " but it is not specified as a source; skipping it.");
+          continue;
+        }
+
+        final double utilizationDiff = utilization - average;
         final long capacity = getCapacity(r, t);
-        final double utilizationDiff = utilization - policy.getAvgUtilization(t);
         final double thresholdDiff = Math.abs(utilizationDiff) - threshold;
         final long maxSize2Move = computeMaxSize2Move(capacity,
-            getRemaining(r, t), utilizationDiff, threshold);
+            getRemaining(r, t), utilizationDiff, maxSizeToMove);
 
         final StorageGroup g;
         if (utilizationDiff > 0) {
@@ -289,7 +351,7 @@ public class Balancer {
           if (thresholdDiff <= 0) { // within threshold
             aboveAvgUtilized.add(s);
           } else {
-            overLoadedBytes += precentage2bytes(thresholdDiff, capacity);
+            overLoadedBytes += percentage2bytes(thresholdDiff, capacity);
             overUtilized.add(s);
           }
           g = s;
@@ -298,7 +360,7 @@ public class Balancer {
           if (thresholdDiff <= 0) { // within threshold
             belowAvgUtilized.add(g);
           } else {
-            underLoadedBytes += precentage2bytes(thresholdDiff, capacity);
+            underLoadedBytes += percentage2bytes(thresholdDiff, capacity);
             underUtilized.add(g);
           }
         }
@@ -318,19 +380,19 @@ public class Balancer {
   }
 
   private static long computeMaxSize2Move(final long capacity, final long remaining,
-      final double utilizationDiff, final double threshold) {
-    final double diff = Math.min(threshold, Math.abs(utilizationDiff));
-    long maxSizeToMove = precentage2bytes(diff, capacity);
+      final double utilizationDiff, final long max) {
+    final double diff = Math.abs(utilizationDiff);
+    long maxSizeToMove = percentage2bytes(diff, capacity);
     if (utilizationDiff < 0) {
       maxSizeToMove = Math.min(remaining, maxSizeToMove);
     }
-    return Math.min(MAX_SIZE_TO_MOVE, maxSizeToMove);
+    return Math.min(max, maxSizeToMove);
   }
 
-  private static long precentage2bytes(double precentage, long capacity) {
-    Preconditions.checkArgument(precentage >= 0,
-        "precentage = " + precentage + " < 0");
-    return (long)(precentage * capacity / 100.0);
+  private static long percentage2bytes(double percentage, long capacity) {
+    Preconditions.checkArgument(percentage >= 0, "percentage = %s < 0",
+        percentage);
+    return (long)(percentage * capacity / 100.0);
   }
 
   /* log the over utilized & under utilized nodes */
@@ -374,6 +436,7 @@ public class Balancer {
     /* first step: match each overUtilized datanode (source) to
      * one or more underUtilized datanodes (targets).
      */
+    LOG.info("chooseStorageGroups for " + matcher + ": overUtilized => underUtilized");
     chooseStorageGroups(overUtilized, underUtilized, matcher);
     
     /* match each remaining overutilized datanode (source) to 
@@ -381,6 +444,7 @@ public class Balancer {
      * Note only overutilized datanodes that haven't had that max bytes to move
      * satisfied in step 1 are selected
      */
+    LOG.info("chooseStorageGroups for " + matcher + ": overUtilized => belowAvgUtilized");
     chooseStorageGroups(overUtilized, belowAvgUtilized, matcher);
 
     /* match each remaining underutilized datanode (target) to 
@@ -388,6 +452,7 @@ public class Balancer {
      * Note only underutilized datanodes that have not had that max bytes to
      * move satisfied in step 1 are selected.
      */
+    LOG.info("chooseStorageGroups for " + matcher + ": underUtilized => aboveAvgUtilized");
     chooseStorageGroups(underUtilized, aboveAvgUtilized, matcher);
   }
 
@@ -459,7 +524,7 @@ public class Balancer {
   }
 
   /* reset all fields in a balancer preparing for the next iteration */
-  private void resetData(Configuration conf) {
+  void resetData(Configuration conf) {
     this.overUtilized.clear();
     this.aboveAvgUtilized.clear();
     this.belowAvgUtilized.clear();
@@ -467,43 +532,72 @@ public class Balancer {
     this.policy.reset();
     dispatcher.reset(conf);;
   }
-  
+
+  static class Result {
+    final ExitStatus exitStatus;
+    final long bytesLeftToMove;
+    final long bytesBeingMoved;
+    final long bytesAlreadyMoved;
+
+    Result(ExitStatus exitStatus, long bytesLeftToMove, long bytesBeingMoved,
+        long bytesAlreadyMoved) {
+      this.exitStatus = exitStatus;
+      this.bytesLeftToMove = bytesLeftToMove;
+      this.bytesBeingMoved = bytesBeingMoved;
+      this.bytesAlreadyMoved = bytesAlreadyMoved;
+    }
+
+    void print(int iteration, PrintStream out) {
+      out.printf("%-24s %10d  %19s  %18s  %17s%n",
+          DateFormat.getDateTimeInstance().format(new Date()), iteration,
+          StringUtils.byteDesc(bytesAlreadyMoved),
+          StringUtils.byteDesc(bytesLeftToMove),
+          StringUtils.byteDesc(bytesBeingMoved));
+    }
+  }
+
+  Result newResult(ExitStatus exitStatus, long bytesLeftToMove, long bytesBeingMoved) {
+    return new Result(exitStatus, bytesLeftToMove, bytesBeingMoved,
+        dispatcher.getBytesMoved());
+  }
+
+  Result newResult(ExitStatus exitStatus) {
+    return new Result(exitStatus, -1, -1, dispatcher.getBytesMoved());
+  }
+
   /** Run an iteration for all datanodes. */
-  private ExitStatus run(int iteration, Formatter formatter,
-      Configuration conf) {
+  Result runOneIteration() {
     try {
       final List<DatanodeStorageReport> reports = dispatcher.init();
       final long bytesLeftToMove = init(reports);
       if (bytesLeftToMove == 0) {
         System.out.println("The cluster is balanced. Exiting...");
-        return ExitStatus.SUCCESS;
+        return newResult(ExitStatus.SUCCESS, bytesLeftToMove, -1);
       } else {
         LOG.info( "Need to move "+ StringUtils.byteDesc(bytesLeftToMove)
             + " to make the cluster balanced." );
       }
-      
+
+      // Should not run the balancer during an unfinalized upgrade, since moved
+      // blocks are not deleted on the source datanode.
+      if (!runDuringUpgrade && nnc.isUpgrading()) {
+        return newResult(ExitStatus.UNFINALIZED_UPGRADE, bytesLeftToMove, -1);
+      }
+
       /* Decide all the nodes that will participate in the block move and
        * the number of bytes that need to be moved from one node to another
        * in this iteration. Maximum bytes to be moved per node is
        * Min(1 Band worth of bytes,  MAX_SIZE_TO_MOVE).
        */
-      final long bytesToMove = chooseStorageGroups();
-      if (bytesToMove == 0) {
+      final long bytesBeingMoved = chooseStorageGroups();
+      if (bytesBeingMoved == 0) {
         System.out.println("No block can be moved. Exiting...");
-        return ExitStatus.NO_MOVE_BLOCK;
+        return newResult(ExitStatus.NO_MOVE_BLOCK, bytesLeftToMove, bytesBeingMoved);
       } else {
-        LOG.info( "Will move " + StringUtils.byteDesc(bytesToMove) +
+        LOG.info( "Will move " + StringUtils.byteDesc(bytesBeingMoved) +
             " in this iteration");
       }
 
-      formatter.format("%-24s %10d  %19s  %18s  %17s%n",
-          DateFormat.getDateTimeInstance().format(new Date()),
-          iteration,
-          StringUtils.byteDesc(dispatcher.getBytesMoved()),
-          StringUtils.byteDesc(bytesLeftToMove),
-          StringUtils.byteDesc(bytesToMove)
-          );
-      
       /* For each pair of <source, target>, start a thread that repeatedly 
        * decide a block to be moved and its proxy source, 
        * then initiates the move until all bytes are moved or no more block
@@ -511,19 +605,19 @@ public class Balancer {
        * Exit no byte has been moved for 5 consecutive iterations.
        */
       if (!dispatcher.dispatchAndCheckContinue()) {
-        return ExitStatus.NO_MOVE_PROGRESS;
+        return newResult(ExitStatus.NO_MOVE_PROGRESS, bytesLeftToMove, bytesBeingMoved);
       }
 
-      return ExitStatus.IN_PROGRESS;
+      return newResult(ExitStatus.IN_PROGRESS, bytesLeftToMove, bytesBeingMoved);
     } catch (IllegalArgumentException e) {
       System.out.println(e + ".  Exiting ...");
-      return ExitStatus.ILLEGAL_ARGUMENTS;
+      return newResult(ExitStatus.ILLEGAL_ARGUMENTS);
     } catch (IOException e) {
       System.out.println(e + ".  Exiting ...");
-      return ExitStatus.IO_EXCEPTION;
+      return newResult(ExitStatus.IO_EXCEPTION);
     } catch (InterruptedException e) {
       System.out.println(e + ".  Exiting ...");
-      return ExitStatus.INTERRUPTED;
+      return newResult(ExitStatus.INTERRUPTED);
     } finally {
       dispatcher.shutdownNow();
     }
@@ -544,34 +638,43 @@ public class Balancer {
             DFSConfigKeys.DFS_NAMENODE_REPLICATION_INTERVAL_DEFAULT) * 1000;
     LOG.info("namenodes  = " + namenodes);
     LOG.info("parameters = " + p);
+    LOG.info("included nodes = " + p.includedNodes);
+    LOG.info("excluded nodes = " + p.excludedNodes);
+    LOG.info("source nodes = " + p.sourceNodes);
     
-    final Formatter formatter = new Formatter(System.out);
     System.out.println("Time Stamp               Iteration#  Bytes Already Moved  Bytes Left To Move  Bytes Being Moved");
     
     List<NameNodeConnector> connectors = Collections.emptyList();
     try {
       connectors = NameNodeConnector.newNameNodeConnectors(namenodes, 
-            Balancer.class.getSimpleName(), BALANCER_ID_PATH, conf);
+            Balancer.class.getSimpleName(), BALANCER_ID_PATH, conf, p.maxIdleIteration);
     
       boolean done = false;
       for(int iteration = 0; !done; iteration++) {
         done = true;
         Collections.shuffle(connectors);
         for(NameNodeConnector nnc : connectors) {
-          final Balancer b = new Balancer(nnc, p, conf);
-          final ExitStatus r = b.run(iteration, formatter, conf);
-          // clean all lists
-          b.resetData(conf);
-          if (r == ExitStatus.IN_PROGRESS) {
-            done = false;
-          } else if (r != ExitStatus.SUCCESS) {
-            //must be an error statue, return.
-            return r.getExitCode();
-          }
-        }
+          if (p.blockpools.size() == 0
+              || p.blockpools.contains(nnc.getBlockpoolID())) {
+            final Balancer b = new Balancer(nnc, p, conf);
+            final Result r = b.runOneIteration();
+            r.print(iteration, System.out);
 
-        if (!done) {
-          Thread.sleep(sleeptime);
+            // clean all lists
+            b.resetData(conf);
+            if (r.exitStatus == ExitStatus.IN_PROGRESS) {
+              done = false;
+            } else if (r.exitStatus != ExitStatus.SUCCESS) {
+              // must be an error statue, return.
+              return r.exitStatus.getExitCode();
+            }
+
+            if (!done) {
+              Thread.sleep(sleeptime);
+            }
+          } else {
+            LOG.info("Skipping blockpool " + nnc.getBlockpoolID());
+          }
         }
       }
     } finally {
@@ -603,31 +706,61 @@ public class Balancer {
   }
 
   static class Parameters {
-    static final Parameters DEFAULT = new Parameters(
-        BalancingPolicy.Node.INSTANCE, 10.0,
-        Collections.<String> emptySet(), Collections.<String> emptySet());
+    static final Parameters DEFAULT =
+        new Parameters(BalancingPolicy.Node.INSTANCE, 10.0,
+            NameNodeConnector.DEFAULT_MAX_IDLE_ITERATIONS,
+            Collections.<String> emptySet(), Collections.<String> emptySet(),
+            Collections.<String> emptySet(), Collections.<String> emptySet(),
+            false);
 
     final BalancingPolicy policy;
     final double threshold;
-    // exclude the nodes in this set from balancing operations
-    Set<String> nodesToBeExcluded;
-    //include only these nodes in balancing operations
-    Set<String> nodesToBeIncluded;
+    final int maxIdleIteration;
+    /** Exclude the nodes in this set. */
+    final Set<String> excludedNodes;
+    /** If empty, include any node; otherwise, include only these nodes. */
+    final Set<String> includedNodes;
+    /** If empty, any node can be a source;
+     *  otherwise, use only these nodes as source nodes.
+     */
+    final Set<String> sourceNodes;
+    /**
+     * A set of block pools to run the balancer on.
+     */
+    final Set<String> blockpools;
+    /**
+     * Whether to run the balancer during upgrade.
+     */
+    final boolean runDuringUpgrade;
 
-    Parameters(BalancingPolicy policy, double threshold,
-        Set<String> nodesToBeExcluded, Set<String> nodesToBeIncluded) {
+    Parameters(BalancingPolicy policy, double threshold, int maxIdleIteration,
+        Set<String> excludedNodes, Set<String> includedNodes,
+        Set<String> sourceNodes, Set<String> blockpools,
+        boolean runDuringUpgrade) {
       this.policy = policy;
       this.threshold = threshold;
-      this.nodesToBeExcluded = nodesToBeExcluded;
-      this.nodesToBeIncluded = nodesToBeIncluded;
+      this.maxIdleIteration = maxIdleIteration;
+      this.excludedNodes = excludedNodes;
+      this.includedNodes = includedNodes;
+      this.sourceNodes = sourceNodes;
+      this.blockpools = blockpools;
+      this.runDuringUpgrade = runDuringUpgrade;
     }
 
     @Override
     public String toString() {
-      return Balancer.class.getSimpleName() + "." + getClass().getSimpleName()
-          + "[" + policy + ", threshold=" + threshold +
-          ", number of nodes to be excluded = "+ nodesToBeExcluded.size() +
-          ", number of nodes to be included = "+ nodesToBeIncluded.size() +"]";
+      return String.format("%s.%s [%s,"
+              + " threshold = %s,"
+              + " max idle iteration = %s,"
+              + " #excluded nodes = %s,"
+              + " #included nodes = %s,"
+              + " #source nodes = %s,"
+              + " #blockpools = %s,"
+              + " run during upgrade = %s]",
+          Balancer.class.getSimpleName(), getClass().getSimpleName(), policy,
+          threshold, maxIdleIteration, excludedNodes.size(),
+          includedNodes.size(), sourceNodes.size(), blockpools.size(),
+          runDuringUpgrade);
     }
   }
 
@@ -640,7 +773,7 @@ public class Balancer {
      */
     @Override
     public int run(String[] args) {
-      final long startTime = Time.now();
+      final long startTime = Time.monotonicNow();
       final Configuration conf = getConf();
 
       try {
@@ -655,8 +788,10 @@ public class Balancer {
         System.out.println(e + ".  Exiting ...");
         return ExitStatus.INTERRUPTED.getExitCode();
       } finally {
-        System.out.format("%-24s ", DateFormat.getDateTimeInstance().format(new Date()));
-        System.out.println("Balancing took " + time2Str(Time.now()-startTime));
+        System.out.format("%-24s ",
+            DateFormat.getDateTimeInstance().format(new Date()));
+        System.out.println("Balancing took "
+            + time2Str(Time.monotonicNow() - startTime));
       }
     }
 
@@ -664,8 +799,12 @@ public class Balancer {
     static Parameters parse(String[] args) {
       BalancingPolicy policy = Parameters.DEFAULT.policy;
       double threshold = Parameters.DEFAULT.threshold;
-      Set<String> nodesTobeExcluded = Parameters.DEFAULT.nodesToBeExcluded;
-      Set<String> nodesTobeIncluded = Parameters.DEFAULT.nodesToBeIncluded;
+      int maxIdleIteration = Parameters.DEFAULT.maxIdleIteration;
+      Set<String> excludedNodes = Parameters.DEFAULT.excludedNodes;
+      Set<String> includedNodes = Parameters.DEFAULT.includedNodes;
+      Set<String> sourceNodes = Parameters.DEFAULT.sourceNodes;
+      Set<String> blockpools = Parameters.DEFAULT.blockpools;
+      boolean runDuringUpgrade = Parameters.DEFAULT.runDuringUpgrade;
 
       if (args != null) {
         try {
@@ -696,35 +835,40 @@ public class Balancer {
                 throw e;
               }
             } else if ("-exclude".equalsIgnoreCase(args[i])) {
-              checkArgument(++i < args.length,
-                  "List of nodes to exclude | -f <filename> is missing: args = "
-                  + Arrays.toString(args));
-              if ("-f".equalsIgnoreCase(args[i])) {
-                checkArgument(++i < args.length,
-                    "File containing nodes to exclude is not specified: args = "
-                    + Arrays.toString(args));
-                nodesTobeExcluded = Util.getHostListFromFile(args[i], "exclude");
-              } else {
-                nodesTobeExcluded = Util.parseHostList(args[i]);
-              }
+              excludedNodes = new HashSet<>();
+              i = processHostList(args, i, "exclude", excludedNodes);
             } else if ("-include".equalsIgnoreCase(args[i])) {
+              includedNodes = new HashSet<>();
+              i = processHostList(args, i, "include", includedNodes);
+            } else if ("-source".equalsIgnoreCase(args[i])) {
+              sourceNodes = new HashSet<>();
+              i = processHostList(args, i, "source", sourceNodes);
+            } else if ("-blockpools".equalsIgnoreCase(args[i])) {
+              checkArgument(
+                  ++i < args.length,
+                  "blockpools value is missing: args = "
+                      + Arrays.toString(args));
+              blockpools = parseBlockPoolList(args[i]);
+              LOG.info("Balancer will run on the following blockpools: "
+                  + blockpools.toString());
+            } else if ("-idleiterations".equalsIgnoreCase(args[i])) {
               checkArgument(++i < args.length,
-                "List of nodes to include | -f <filename> is missing: args = "
-                + Arrays.toString(args));
-              if ("-f".equalsIgnoreCase(args[i])) {
-                checkArgument(++i < args.length,
-                    "File containing nodes to include is not specified: args = "
-                    + Arrays.toString(args));
-                nodesTobeIncluded = Util.getHostListFromFile(args[i], "include");
-               } else {
-                nodesTobeIncluded = Util.parseHostList(args[i]);
-              }
+                  "idleiterations value is missing: args = " + Arrays
+                      .toString(args));
+              maxIdleIteration = Integer.parseInt(args[i]);
+              LOG.info("Using a idleiterations of " + maxIdleIteration);
+            } else if ("-runDuringUpgrade".equalsIgnoreCase(args[i])) {
+              runDuringUpgrade = true;
+              LOG.info("Will run the balancer even during an ongoing HDFS "
+                  + "upgrade. Most users will not want to run the balancer "
+                  + "during an upgrade since it will not affect used space "
+                  + "on over-utilized machines.");
             } else {
               throw new IllegalArgumentException("args = "
                   + Arrays.toString(args));
             }
           }
-          checkArgument(nodesTobeExcluded.isEmpty() || nodesTobeIncluded.isEmpty(),
+          checkArgument(excludedNodes.isEmpty() || includedNodes.isEmpty(),
               "-exclude and -include options cannot be specified together.");
         } catch(RuntimeException e) {
           printUsage(System.err);
@@ -732,7 +876,37 @@ public class Balancer {
         }
       }
       
-      return new Parameters(policy, threshold, nodesTobeExcluded, nodesTobeIncluded);
+      return new Parameters(policy, threshold, maxIdleIteration, excludedNodes,
+          includedNodes, sourceNodes, blockpools, runDuringUpgrade);
+    }
+
+    private static int processHostList(String[] args, int i, String type,
+        Set<String> nodes) {
+      Preconditions.checkArgument(++i < args.length,
+          "List of %s nodes | -f <filename> is missing: args=%s",
+          type, Arrays.toString(args));
+      if ("-f".equalsIgnoreCase(args[i])) {
+        Preconditions.checkArgument(++i < args.length,
+            "File containing %s nodes is not specified: args=%s",
+            type, Arrays.toString(args));
+
+        final String filename = args[i];
+        try {
+          HostsFileReader.readFileToSet(type, filename, nodes);
+        } catch (IOException e) {
+          throw new IllegalArgumentException(
+              "Failed to read " + type + " node list from file: " + filename);
+        }
+      } else {
+        final String[] addresses = StringUtils.getTrimmedStrings(args[i]);
+        nodes.addAll(Arrays.asList(addresses));
+      }
+      return i;
+    }
+
+    private static Set<String> parseBlockPoolList(String string) {
+      String[] addrs = StringUtils.getTrimmedStrings(string);
+      return new HashSet<String>(Arrays.asList(addrs));
     }
 
     private static void printUsage(PrintStream out) {

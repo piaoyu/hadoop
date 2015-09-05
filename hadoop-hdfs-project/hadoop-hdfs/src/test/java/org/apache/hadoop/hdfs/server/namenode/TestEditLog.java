@@ -17,9 +17,14 @@
  */
 package org.apache.hadoop.hdfs.server.namenode;
 
+import static org.apache.hadoop.fs.permission.AclEntryScope.*;
+import static org.apache.hadoop.fs.permission.AclEntryType.*;
+import static org.apache.hadoop.fs.permission.FsAction.*;
+import static org.apache.hadoop.hdfs.server.namenode.AclTestHelpers.*;
 import static org.apache.hadoop.test.MetricsAsserts.assertCounter;
 import static org.apache.hadoop.test.MetricsAsserts.getMetrics;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -57,14 +62,17 @@ import org.apache.hadoop.fs.ChecksumException;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.FileUtil;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.permission.AclEntry;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.fs.permission.PermissionStatus;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
+import org.apache.hadoop.hdfs.DFSInotifyEventInputStream;
+import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.hadoop.hdfs.HdfsConfiguration;
 import org.apache.hadoop.hdfs.MiniDFSCluster;
-import org.apache.hadoop.hdfs.protocol.HdfsConstants;
 import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfo;
+import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;
 import org.apache.hadoop.hdfs.server.common.Storage.StorageDirectory;
 import org.apache.hadoop.hdfs.server.namenode.NNStorage.NameNodeDirType;
 import org.apache.hadoop.hdfs.server.namenode.metrics.NameNodeMetrics;
@@ -77,6 +85,9 @@ import org.apache.hadoop.test.PathUtils;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.Time;
 import org.apache.log4j.Level;
+import org.apache.log4j.AppenderSkeleton;
+import org.apache.log4j.LogManager;
+import org.apache.log4j.spi.LoggingEvent;
 import org.junit.Test;
 import org.mockito.Mockito;
 import org.xml.sax.ContentHandler;
@@ -101,6 +112,11 @@ public class TestEditLog {
   public static class GarbageMkdirOp extends FSEditLogOp {
     public GarbageMkdirOp() {
       super(FSEditLogOpCodes.OP_MKDIR);
+    }
+
+    @Override
+    void resetSubFields() {
+      // nop
     }
 
     @Override
@@ -193,7 +209,7 @@ public class TestEditLog {
       FSEditLog editLog = namesystem.getEditLog();
 
       for (int i = 0; i < numTransactions; i++) {
-        INodeFile inode = new INodeFile(namesystem.allocateNewInodeId(), null,
+        INodeFile inode = new INodeFile(namesystem.dir.allocateNewInodeId(), null,
             p, 0L, 0L, BlockInfo.EMPTY_ARRAY, replication, blockSize);
         inode.toUnderConstruction("", "");
 
@@ -286,7 +302,7 @@ public class TestEditLog {
       editLog.logSetReplication("fakefile", (short) 1);
       editLog.logSync();
       
-      editLog.rollEditLog();
+      editLog.rollEditLog(NameNodeLayoutVersion.CURRENT_LAYOUT_VERSION);
 
       assertExistsInStorageDirs(
           cluster, NameNodeDirType.EDITS,
@@ -359,12 +375,12 @@ public class TestEditLog {
       
       // Roll log so new output buffer size takes effect
       // we should now be writing to edits_inprogress_3
-      fsimage.rollEditLog();
+      fsimage.rollEditLog(NameNodeLayoutVersion.CURRENT_LAYOUT_VERSION);
     
       // Remember the current lastInodeId and will reset it back to test
       // loading editlog segments.The transactions in the following allocate new
       // inode id to write to editlogs but doesn't create ionde in namespace
-      long originalLastInodeId = namesystem.getLastInodeId();
+      long originalLastInodeId = namesystem.dir.getLastInodeId();
       
       // Create threads and make them run transactions concurrently.
       Thread threadId[] = new Thread[NUM_THREADS];
@@ -390,7 +406,7 @@ public class TestEditLog {
       trans.run();
 
       // Roll another time to finalize edits_inprogress_3
-      fsimage.rollEditLog();
+      fsimage.rollEditLog(NameNodeLayoutVersion.CURRENT_LAYOUT_VERSION);
       
       long expectedTxns = ((NUM_THREADS+1) * 2 * NUM_TRANSACTIONS) + 2; // +2 for start/end txns
    
@@ -398,7 +414,7 @@ public class TestEditLog {
       // If there were any corruptions, it is likely that the reading in
       // of these transactions will throw an exception.
       //
-      namesystem.resetLastInodeIdWithoutChecking(originalLastInodeId);
+      namesystem.dir.resetLastInodeIdWithoutChecking(originalLastInodeId);
       for (Iterator<StorageDirectory> it = 
               fsimage.getStorage().dirIterator(NameNodeDirType.EDITS); it.hasNext();) {
         FSEditLogLoader loader = new FSEditLogLoader(namesystem, 0);
@@ -864,17 +880,17 @@ public class TestEditLog {
       tracker = new FSEditLogLoader.PositionTrackingInputStream(in);
       in = new DataInputStream(tracker);
             
-      reader = new FSEditLogOp.Reader(in, tracker, version);
+      reader = FSEditLogOp.Reader.create(in, tracker, version);
     }
   
     @Override
     public long getFirstTxId() {
-      return HdfsConstants.INVALID_TXID;
+      return HdfsServerConstants.INVALID_TXID;
     }
     
     @Override
     public long getLastTxId() {
-      return HdfsConstants.INVALID_TXID;
+      return HdfsServerConstants.INVALID_TXID;
     }
   
     @Override
@@ -929,7 +945,7 @@ public class TestEditLog {
     FSEditLog log = FSImageTestUtil.createStandaloneEditLog(logDir);
     try {
       FileUtil.setWritable(logDir, false);
-      log.openForWrite();
+      log.openForWrite(NameNodeLayoutVersion.CURRENT_LAYOUT_VERSION);
       fail("Did no throw exception on only having a bad dir");
     } catch (IOException ioe) {
       GenericTestUtils.assertExceptionContains(
@@ -954,7 +970,7 @@ public class TestEditLog {
         new byte[500]);
     
     try {
-      log.openForWrite();
+      log.openForWrite(NameNodeLayoutVersion.CURRENT_LAYOUT_VERSION);
       NameNodeMetrics mockMetrics = Mockito.mock(NameNodeMetrics.class);
       log.setMetricsForTests(mockMetrics);
 
@@ -1128,7 +1144,7 @@ public class TestEditLog {
     // logGenerationStamp is used, simply because it doesn't 
     // require complex arguments.
     editlog.initJournalsForWrite();
-    editlog.openForWrite();
+    editlog.openForWrite(NameNodeLayoutVersion.CURRENT_LAYOUT_VERSION);
     for (int i = 2; i < TXNS_PER_ROLL; i++) {
       editlog.logGenerationStampV2((long) 0);
     }
@@ -1140,7 +1156,7 @@ public class TestEditLog {
     // the specified journal is aborted. It will be brought
     // back into rotation automatically by rollEditLog
     for (int i = 0; i < numrolls; i++) {
-      editlog.rollEditLog();
+      editlog.rollEditLog(NameNodeLayoutVersion.CURRENT_LAYOUT_VERSION);
       
       editlog.logGenerationStampV2((long) i);
       editlog.logSync();
@@ -1212,7 +1228,8 @@ public class TestEditLog {
                                                                           TXNS_PER_ROLL*11);
 
     for (EditLogInputStream edits : editStreams) {
-      FSEditLogLoader.EditLogValidation val = FSEditLogLoader.validateEditLog(edits);
+      FSEditLogLoader.EditLogValidation val =
+          FSEditLogLoader.validateEditLog(edits, Long.MAX_VALUE);
       long read = (val.getEndTxId() - edits.getFirstTxId()) + 1;
       LOG.info("Loading edits " + edits + " read " + read);
       assertEquals(startTxId, edits.getFirstTxId());
@@ -1474,7 +1491,7 @@ public class TestEditLog {
             cluster, NameNodeDirType.EDITS,
             NNStorage.getInProgressEditsFileName((i * 3) + 1));
         editLog.logSync();
-        editLog.rollEditLog();
+        editLog.rollEditLog(NameNodeLayoutVersion.CURRENT_LAYOUT_VERSION);
         assertExistsInStorageDirs(
             cluster, NameNodeDirType.EDITS,
             NNStorage.getFinalizedEditsFileName((i * 3) + 1, (i * 3) + 3));
@@ -1500,5 +1517,161 @@ public class TestEditLog {
     double delta = ((float)(endTime - startTime)) / 1000.0;
     LOG.info(String.format("loaded %d edit log segments in %.2f seconds",
         NUM_EDIT_LOG_ROLLS, delta));
+  }
+
+  /**
+   * Edit log op instances are cached internally using thread-local storage.
+   * This test checks that the cached instances are reset in between different
+   * transactions processed on the same thread, so that we don't accidentally
+   * apply incorrect attributes to an inode.
+   *
+   * @throws IOException if there is an I/O error
+   */
+  @Test
+  public void testResetThreadLocalCachedOps() throws IOException {
+    Configuration conf = new HdfsConfiguration();
+    conf.setBoolean(DFSConfigKeys.DFS_NAMENODE_ACLS_ENABLED_KEY, true);
+    // Set single handler thread, so all transactions hit same thread-local ops.
+    conf.setInt(DFSConfigKeys.DFS_NAMENODE_HANDLER_COUNT_KEY, 1);
+    MiniDFSCluster cluster = null;
+    FileSystem fileSys = null;
+    try {
+      cluster = new MiniDFSCluster.Builder(conf).numDataNodes(1).build();
+      cluster.waitActive();
+      fileSys = cluster.getFileSystem();
+
+      // Create /dir1 with a default ACL.
+      Path dir1 = new Path("/dir1");
+      fileSys.mkdirs(dir1);
+      List<AclEntry> aclSpec = Lists.newArrayList(
+          aclEntry(DEFAULT, USER, "foo", READ_EXECUTE));
+      fileSys.modifyAclEntries(dir1, aclSpec);
+
+      // /dir1/dir2 is expected to clone the default ACL.
+      Path dir2 = new Path("/dir1/dir2");
+      fileSys.mkdirs(dir2);
+
+      // /dir1/file1 is expected to clone the default ACL.
+      Path file1 = new Path("/dir1/file1");
+      fileSys.create(file1).close();
+
+      // /dir3 is not a child of /dir1, so must not clone the default ACL.
+      Path dir3 = new Path("/dir3");
+      fileSys.mkdirs(dir3);
+
+      // /file2 is not a child of /dir1, so must not clone the default ACL.
+      Path file2 = new Path("/file2");
+      fileSys.create(file2).close();
+
+      // Restart and assert the above stated expectations.
+      IOUtils.cleanup(LOG, fileSys);
+      cluster.restartNameNode();
+      fileSys = cluster.getFileSystem();
+      assertFalse(fileSys.getAclStatus(dir1).getEntries().isEmpty());
+      assertFalse(fileSys.getAclStatus(dir2).getEntries().isEmpty());
+      assertFalse(fileSys.getAclStatus(file1).getEntries().isEmpty());
+      assertTrue(fileSys.getAclStatus(dir3).getEntries().isEmpty());
+      assertTrue(fileSys.getAclStatus(file2).getEntries().isEmpty());
+    } finally {
+      IOUtils.cleanup(LOG, fileSys);
+      if (cluster != null) {
+        cluster.shutdown();
+      }
+    }
+  }
+
+  class TestAppender extends AppenderSkeleton {
+    private final List<LoggingEvent> log = new ArrayList<>();
+
+    @Override
+    public boolean requiresLayout() {
+      return false;
+    }
+
+    @Override
+    protected void append(final LoggingEvent loggingEvent) {
+      log.add(loggingEvent);
+    }
+
+    @Override
+    public void close() {
+    }
+
+    public List<LoggingEvent> getLog() {
+      return new ArrayList<>(log);
+    }
+  }
+
+  /**
+   *
+   * @throws Exception
+   */
+  @Test
+  public void testReadActivelyUpdatedLog() throws Exception {
+    final TestAppender appender = new TestAppender();
+    LogManager.getRootLogger().addAppender(appender);
+    Configuration conf = new HdfsConfiguration();
+    conf.setBoolean(DFSConfigKeys.DFS_NAMENODE_ACLS_ENABLED_KEY, true);
+    // Set single handler thread, so all transactions hit same thread-local ops.
+    conf.setInt(DFSConfigKeys.DFS_NAMENODE_HANDLER_COUNT_KEY, 1);
+    MiniDFSCluster cluster = null;
+    try {
+      cluster = new MiniDFSCluster.Builder(conf).numDataNodes(1).build();
+      cluster.waitActive();
+      FSImage fsimage = cluster.getNamesystem().getFSImage();
+      StorageDirectory sd = fsimage.getStorage().getStorageDir(0);
+
+      final DistributedFileSystem fileSys = cluster.getFileSystem();
+      DFSInotifyEventInputStream events = fileSys.getInotifyEventStream();
+      fileSys.mkdirs(new Path("/test"));
+      fileSys.mkdirs(new Path("/test/dir1"));
+      fileSys.delete(new Path("/test/dir1"), true);
+      fsimage.getEditLog().logSync();
+      fileSys.mkdirs(new Path("/test/dir2"));
+
+
+      final File inProgressEdit = NNStorage.getInProgressEditsFile(sd, 1);
+      assertTrue(inProgressEdit.exists());
+      EditLogFileInputStream elis = new EditLogFileInputStream(inProgressEdit);
+      FSEditLogOp op;
+      long pos = 0;
+
+      while (true) {
+        op = elis.readOp();
+        if (op != null && op.opCode != FSEditLogOpCodes.OP_INVALID) {
+          pos = elis.getPosition();
+        } else {
+          break;
+        }
+      }
+      elis.close();
+      assertTrue(pos > 0);
+
+      RandomAccessFile rwf = new RandomAccessFile(inProgressEdit, "rw");
+      rwf.seek(pos);
+      assertEquals(rwf.readByte(), (byte) -1);
+
+      rwf.seek(pos + 1);
+      rwf.writeByte(2);
+
+      rwf.close();
+
+      events.poll();
+      String pattern = "Caught exception after reading (.*) ops";
+      Pattern r = Pattern.compile(pattern);
+      final List<LoggingEvent> log = appender.getLog();
+      for (LoggingEvent event : log) {
+        Matcher m = r.matcher(event.getRenderedMessage());
+        if (m.find()) {
+          fail("Should not try to read past latest syned edit log op");
+        }
+      }
+
+    } finally {
+      if (cluster != null) {
+        cluster.shutdown();
+      }
+      LogManager.getRootLogger().removeAppender(appender);
+    }
   }
 }

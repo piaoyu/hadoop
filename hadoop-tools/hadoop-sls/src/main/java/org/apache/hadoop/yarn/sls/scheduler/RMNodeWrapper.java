@@ -27,12 +27,14 @@ import org.apache.hadoop.yarn.api.records.NodeId;
 import org.apache.hadoop.yarn.api.records.NodeState;
 import org.apache.hadoop.yarn.api.records.Resource;
 import org.apache.hadoop.yarn.server.api.protocolrecords.NodeHeartbeatResponse;
+import org.apache.hadoop.yarn.server.resourcemanager.nodelabels.RMNodeLabelsManager;
 import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
 import org.apache.hadoop.yarn.server.resourcemanager.rmnode
         .UpdatedContainerInfo;
 
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 
 @Private
 @Unstable
@@ -117,6 +119,11 @@ public class RMNodeWrapper implements RMNode {
   }
 
   @Override
+  public List<ApplicationId> getRunningApps() {
+    return node.getRunningApps();
+  }
+
+  @Override
   public void updateNodeHeartbeatResponseForCleanup(
           NodeHeartbeatResponse nodeHeartbeatResponse) {
     node.updateNodeHeartbeatResponseForCleanup(nodeHeartbeatResponse);
@@ -125,6 +132,11 @@ public class RMNodeWrapper implements RMNode {
   @Override
   public NodeHeartbeatResponse getLastNodeHeartBeatResponse() {
     return node.getLastNodeHeartBeatResponse();
+  }
+
+  @Override
+  public void resetLastNodeHeartBeatResponse() {
+    node.getLastNodeHeartBeatResponse().setResponseId(0);
   }
 
   @Override
@@ -147,4 +159,8 @@ public class RMNodeWrapper implements RMNode {
     return node.getNodeManagerVersion();
   }
 
+  @Override
+  public Set<String> getNodeLabels() {
+    return RMNodeLabelsManager.EMPTY_STRING_SET;
+  }
 }

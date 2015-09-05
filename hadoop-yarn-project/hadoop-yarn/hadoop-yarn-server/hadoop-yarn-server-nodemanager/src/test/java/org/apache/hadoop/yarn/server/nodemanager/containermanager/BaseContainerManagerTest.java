@@ -26,6 +26,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import org.apache.hadoop.yarn.server.nodemanager.executor.DeletionAsUserContext;
 import org.junit.Assert;
 
 import org.apache.commons.logging.Log;
@@ -57,6 +58,7 @@ import org.apache.hadoop.yarn.server.nodemanager.DeletionService;
 import org.apache.hadoop.yarn.server.nodemanager.LocalDirsHandlerService;
 import org.apache.hadoop.yarn.server.nodemanager.LocalRMInterface;
 import org.apache.hadoop.yarn.server.nodemanager.NodeHealthCheckerService;
+import org.apache.hadoop.yarn.server.nodemanager.NodeManager;
 import org.apache.hadoop.yarn.server.nodemanager.NodeManager.NMContext;
 import org.apache.hadoop.yarn.server.nodemanager.NodeStatusUpdater;
 import org.apache.hadoop.yarn.server.nodemanager.NodeStatusUpdaterImpl;
@@ -174,9 +176,10 @@ public abstract class BaseContainerManagerTest {
     delSrvc.init(conf);
 
     exec = createContainerExecutor();
-    nodeHealthChecker = new NodeHealthCheckerService();
+    dirsHandler = new LocalDirsHandlerService();
+    nodeHealthChecker = new NodeHealthCheckerService(
+        NodeManager.getNodeHealthScriptRunner(conf), dirsHandler);
     nodeHealthChecker.init(conf);
-    dirsHandler = nodeHealthChecker.getDiskHandler();
     containerManager = createContainerManager(delSrvc);
     ((NMContext)context).setContainerManager(containerManager);
     nodeStatusUpdater.init(conf);
@@ -188,7 +191,7 @@ public abstract class BaseContainerManagerTest {
       createContainerManager(DeletionService delSrvc) {
     
     return new ContainerManagerImpl(context, exec, delSrvc, nodeStatusUpdater,
-      metrics, new ApplicationACLsManager(conf), dirsHandler) {
+      metrics, dirsHandler) {
       @Override
       public void
           setBlockNewContainerRequests(boolean blockNewContainerRequests) {
@@ -227,6 +230,12 @@ public abstract class BaseContainerManagerTest {
             ByteBuffer.wrap("AuxServiceMetaData2".getBytes()));
         return serviceData;
       }
+
+      @Override
+      protected NMTokenIdentifier selectNMTokenIdentifier(
+          UserGroupInformation remoteUgi) {
+        return new NMTokenIdentifier();
+      }
     };
   }
 
@@ -246,8 +255,11 @@ public abstract class BaseContainerManagerTest {
     if (containerManager != null) {
       containerManager.stop();
     }
-    createContainerExecutor().deleteAsUser(user,
-        new Path(localDir.getAbsolutePath()), new Path[] {});
+    createContainerExecutor().deleteAsUser(new DeletionAsUserContext.Builder()
+        .setUser(user)
+        .setSubDir(new Path(localDir.getAbsolutePath()))
+        .setBasedirs(new Path[] {})
+        .build());
   }
 
   public static void waitForContainerState(ContainerManagementProtocol containerManager,

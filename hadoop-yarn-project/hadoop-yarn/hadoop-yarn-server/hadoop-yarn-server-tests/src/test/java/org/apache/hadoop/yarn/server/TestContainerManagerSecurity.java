@@ -82,8 +82,6 @@ import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 import org.junit.runners.Parameterized.Parameters;
 
-import com.google.common.io.ByteArrayDataInput;
-import com.google.common.io.ByteStreams;
 
 @RunWith(Parameterized.class)
 public class TestContainerManagerSecurity extends KerberosSecurityTestcase {
@@ -105,10 +103,20 @@ public class TestContainerManagerSecurity extends KerberosSecurityTestcase {
     testRootDir.mkdirs();
     httpSpnegoKeytabFile.deleteOnExit();
     getKdc().createPrincipal(httpSpnegoKeytabFile, httpSpnegoPrincipal);
+
+    yarnCluster =
+        new MiniYARNCluster(TestContainerManagerSecurity.class.getName(), 1, 1,
+            1);
+    yarnCluster.init(conf);
+    yarnCluster.start();
   }
  
   @After
   public void tearDown() {
+    if (yarnCluster != null) {
+      yarnCluster.stop();
+      yarnCluster = null;
+    }
     testRootDir.delete();
   }
 
@@ -144,11 +152,6 @@ public class TestContainerManagerSecurity extends KerberosSecurityTestcase {
   
   @Test (timeout = 120000)
   public void testContainerManager() throws Exception {
-    try {
-      yarnCluster = new MiniYARNCluster(TestContainerManagerSecurity.class
-          .getName(), 1, 1, 1);
-      yarnCluster.init(conf);
-      yarnCluster.start();
       
       // TestNMTokens.
       testNMTokens(conf);
@@ -156,36 +159,11 @@ public class TestContainerManagerSecurity extends KerberosSecurityTestcase {
       // Testing for container token tampering
       testContainerToken(conf);
       
-    } catch (Exception e) {
-      e.printStackTrace();
-      throw e;
-    } finally {
-      if (yarnCluster != null) {
-        yarnCluster.stop();
-        yarnCluster = null;
-      }
-    }
-  }
-
-  @Test (timeout = 120000)
-  public void testContainerManagerWithEpoch() throws Exception {
-    try {
-      yarnCluster = new MiniYARNCluster(TestContainerManagerSecurity.class
-          .getName(), 1, 1, 1);
-      yarnCluster.init(conf);
-      yarnCluster.start();
-
-      // Testing for container token tampering
+      // Testing for container token tampering with epoch
       testContainerTokenWithEpoch(conf);
 
-    } finally {
-      if (yarnCluster != null) {
-        yarnCluster.stop();
-        yarnCluster = null;
-      }
-    }
   }
-  
+
   private void testNMTokens(Configuration conf) throws Exception {
     NMTokenSecretManagerInRM nmTokenSecretManagerRM =
         yarnCluster.getResourceManager().getRMContext()
@@ -231,7 +209,7 @@ public class TestContainerManagerSecurity extends KerberosSecurityTestcase {
         ApplicationAttemptId.newInstance(appId, 1);
     
     ContainerId validContainerId =
-        ContainerId.newInstance(validAppAttemptId, 0);
+        ContainerId.newContainerId(validAppAttemptId, 0);
     
     NodeId validNode = yarnCluster.getNodeManager(0).getNMContext().getNodeId();
     NodeId invalidNode = NodeId.newInstance("InvalidHost", 1234);
@@ -311,7 +289,7 @@ public class TestContainerManagerSecurity extends KerberosSecurityTestcase {
         ApplicationAttemptId.newInstance(appId, 2);
         
     ContainerId validContainerId2 =
-        ContainerId.newInstance(validAppAttemptId2, 0);
+        ContainerId.newContainerId(validAppAttemptId2, 0);
 
     org.apache.hadoop.yarn.api.records.Token validContainerToken2 =
         containerTokenSecretManager.createContainerToken(validContainerId2,
@@ -401,7 +379,7 @@ public class TestContainerManagerSecurity extends KerberosSecurityTestcase {
           .createNMToken(validAppAttemptId, validNode, user);
     org.apache.hadoop.yarn.api.records.Token newContainerToken =
         containerTokenSecretManager.createContainerToken(
-          ContainerId.newInstance(attempt2, 1), validNode, user, r,
+          ContainerId.newContainerId(attempt2, 1), validNode, user, r,
             Priority.newInstance(0), 0);
     Assert.assertTrue(testStartContainer(rpc, attempt2, validNode,
       newContainerToken, attempt1NMToken, false).isEmpty());
@@ -638,7 +616,7 @@ public class TestContainerManagerSecurity extends KerberosSecurityTestcase {
     ApplicationId appId = ApplicationId.newInstance(1, 1);
     ApplicationAttemptId appAttemptId =
         ApplicationAttemptId.newInstance(appId, 0);
-    ContainerId cId = ContainerId.newInstance(appAttemptId, 0);
+    ContainerId cId = ContainerId.newContainerId(appAttemptId, 0);
     NodeManager nm = yarnCluster.getNodeManager(0);
     NMTokenSecretManagerInNM nmTokenSecretManagerInNM =
         nm.getNMContext().getNMTokenSecretManager();
@@ -691,7 +669,7 @@ public class TestContainerManagerSecurity extends KerberosSecurityTestcase {
     } while (containerTokenSecretManager.getCurrentKey().getKeyId()
         == tamperedContainerTokenSecretManager.getCurrentKey().getKeyId());
     
-    ContainerId cId2 = ContainerId.newInstance(appAttemptId, 1);
+    ContainerId cId2 = ContainerId.newContainerId(appAttemptId, 1);
     // Creating modified containerToken
     Token containerToken2 =
         tamperedContainerTokenSecretManager.createContainerToken(cId2, nodeId,
@@ -733,7 +711,7 @@ public class TestContainerManagerSecurity extends KerberosSecurityTestcase {
     ApplicationId appId = ApplicationId.newInstance(1, 1);
     ApplicationAttemptId appAttemptId =
         ApplicationAttemptId.newInstance(appId, 0);
-    ContainerId cId = ContainerId.newInstance(appAttemptId, (5L << 40) | 3L);
+    ContainerId cId = ContainerId.newContainerId(appAttemptId, (5L << 40) | 3L);
     NodeManager nm = yarnCluster.getNodeManager(0);
     NMTokenSecretManagerInNM nmTokenSecretManagerInNM =
         nm.getNMContext().getNMTokenSecretManager();

@@ -33,6 +33,8 @@ import org.apache.hadoop.security.SecurityUtil;
 import org.apache.hadoop.service.CompositeService;
 import org.apache.hadoop.service.Service;
 import org.apache.hadoop.util.ExitUtil;
+import org.apache.hadoop.util.GenericOptionsParser;
+import org.apache.hadoop.util.JvmPauseMonitor;
 import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.hadoop.util.ShutdownHookManager;
 import org.apache.hadoop.util.StringUtils;
@@ -45,6 +47,7 @@ import org.apache.hadoop.yarn.server.timeline.LeveldbTimelineStore;
 import org.apache.hadoop.yarn.server.timeline.TimelineDataManager;
 import org.apache.hadoop.yarn.server.timeline.TimelineStore;
 import org.apache.hadoop.yarn.server.timeline.security.TimelineACLsManager;
+import org.apache.hadoop.yarn.server.timeline.security.TimelineAuthenticationFilter;
 import org.apache.hadoop.yarn.server.timeline.security.TimelineAuthenticationFilterInitializer;
 import org.apache.hadoop.yarn.server.timeline.security.TimelineDelegationTokenSecretManagerService;
 import org.apache.hadoop.yarn.server.timeline.webapp.CrossOriginFilterInitializer;
@@ -71,6 +74,7 @@ public class ApplicationHistoryServer extends CompositeService {
   private TimelineDelegationTokenSecretManagerService secretManagerService;
   private TimelineDataManager timelineDataManager;
   private WebApp webApp;
+  private JvmPauseMonitor pauseMonitor;
 
   public ApplicationHistoryServer() {
     super(ApplicationHistoryServer.class.getName());
@@ -94,7 +98,9 @@ public class ApplicationHistoryServer extends CompositeService {
     addService((Service) historyManager);
 
     DefaultMetricsSystem.initialize("ApplicationHistoryServer");
-    JvmMetrics.initSingleton("ApplicationHistoryServer", null);
+    JvmMetrics jm = JvmMetrics.initSingleton("ApplicationHistoryServer", null);
+    pauseMonitor = new JvmPauseMonitor(conf);
+    jm.setPauseMonitor(pauseMonitor);
     super.serviceInit(conf);
   }
 
@@ -106,8 +112,11 @@ public class ApplicationHistoryServer extends CompositeService {
       throw new YarnRuntimeException("Failed to login", ie);
     }
 
-    startWebApp();
+    if (pauseMonitor != null) {
+      pauseMonitor.start();
+    }
     super.serviceStart();
+    startWebApp();
   }
 
   @Override
@@ -115,7 +124,9 @@ public class ApplicationHistoryServer extends CompositeService {
     if (webApp != null) {
       webApp.stop();
     }
-
+    if (pauseMonitor != null) {
+      pauseMonitor.stop();
+    }
     DefaultMetricsSystem.shutdown();
     super.serviceStop();
   }
@@ -153,6 +164,7 @@ public class ApplicationHistoryServer extends CompositeService {
         new CompositeServiceShutdownHook(appHistoryServer),
         SHUTDOWN_HOOK_PRIORITY);
       YarnConfiguration conf = new YarnConfiguration();
+      new GenericOptionsParser(conf, args);
       appHistoryServer.init(conf);
       appHistoryServer.start();
     } catch (Throwable t) {
@@ -213,6 +225,8 @@ public class ApplicationHistoryServer extends CompositeService {
 
   private void startWebApp() {
     Configuration conf = getConfig();
+    TimelineAuthenticationFilter.setTimelineDelegationTokenSecretManager(
+        secretManagerService.getTimelineDelegationTokenSecretManager());
     // Always load pseudo authentication filter to parse "user.name" in an URL
     // to identify a HTTP request's user in insecure mode.
     // When Kerberos authentication type is set (i.e., secure mode is turned on),
@@ -263,15 +277,12 @@ public class ApplicationHistoryServer extends CompositeService {
                           WebAppUtils.getAHSWebAppURLWithoutScheme(conf));
     LOG.info("Instantiating AHSWebApp at " + bindAddress);
     try {
-      AHSWebApp ahsWebApp = AHSWebApp.getInstance();
-      ahsWebApp.setApplicationHistoryManager(historyManager);
-      ahsWebApp.setTimelineDelegationTokenSecretManagerService(secretManagerService);
-      ahsWebApp.setTimelineDataManager(timelineDataManager);
       webApp =
           WebApps
             .$for("applicationhistory", ApplicationHistoryClientService.class,
                 ahsClientService, "ws")
-            .with(conf).at(bindAddress).start(ahsWebApp);
+            .with(conf).at(bindAddress).start(
+                new AHSWebApp(timelineDataManager, ahsClientService));
     } catch (Exception e) {
       String msg = "AHSWebApp failed to start.";
       LOG.error(msg, e);

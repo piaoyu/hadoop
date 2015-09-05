@@ -34,8 +34,8 @@ import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.DFSTestUtil;
 import org.apache.hadoop.hdfs.HdfsConfiguration;
 import org.apache.hadoop.hdfs.TestBlockStoragePolicy;
-import org.apache.hadoop.hdfs.protocol.HdfsConstants;
 import org.apache.hadoop.hdfs.security.token.block.ExportedBlockKeys;
+import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;
 import org.apache.hadoop.hdfs.server.common.HdfsServerConstants.NodeType;
 import org.apache.hadoop.hdfs.server.common.StorageInfo;
 import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
@@ -93,11 +93,11 @@ public class TestReplicationPolicyConsiderLoad {
       dnrList.add(dnr);
       dnManager.registerDatanode(dnr);
       dataNodes[i].getStorageInfos()[0].setUtilizationForTesting(
-          2*HdfsConstants.MIN_BLOCKS_FOR_WRITE*blockSize, 0L,
-          2*HdfsConstants.MIN_BLOCKS_FOR_WRITE*blockSize, 0L);
+          2* HdfsServerConstants.MIN_BLOCKS_FOR_WRITE*blockSize, 0L,
+          2* HdfsServerConstants.MIN_BLOCKS_FOR_WRITE*blockSize, 0L);
       dataNodes[i].updateHeartbeat(
           BlockManagerTestUtil.getStorageReportsForDatanode(dataNodes[i]),
-          0L, 0L, 0, 0);
+          0L, 0L, 0, 0, null);
     }
   }
 
@@ -115,31 +115,33 @@ public class TestReplicationPolicyConsiderLoad {
           BlockManagerTestUtil.getStorageReportsForDatanode(dataNodes[3]),
           blockPoolId, dataNodes[3].getCacheCapacity(),
           dataNodes[3].getCacheRemaining(),
-          2, 0, 0);
+          2, 0, 0, null);
       dnManager.handleHeartbeat(dnrList.get(4),
           BlockManagerTestUtil.getStorageReportsForDatanode(dataNodes[4]),
           blockPoolId, dataNodes[4].getCacheCapacity(),
           dataNodes[4].getCacheRemaining(),
-          4, 0, 0);
+          4, 0, 0, null);
       dnManager.handleHeartbeat(dnrList.get(5),
           BlockManagerTestUtil.getStorageReportsForDatanode(dataNodes[5]),
           blockPoolId, dataNodes[5].getCacheCapacity(),
           dataNodes[5].getCacheRemaining(),
-          4, 0, 0);
+          4, 0, 0, null);
       // value in the above heartbeats
       final int load = 2 + 4 + 4;
       
       FSNamesystem fsn = namenode.getNamesystem();
-      assertEquals((double)load/6, fsn.getInServiceXceiverAverage(), EPSILON);
+      assertEquals((double)load/6, dnManager.getFSClusterStats()
+        .getInServiceXceiverAverage(), EPSILON);
       
       // Decommission DNs so BlockPlacementPolicyDefault.isGoodTarget()
       // returns false
       for (int i = 0; i < 3; i++) {
         DatanodeDescriptor d = dnManager.getDatanode(dnrList.get(i));
-        dnManager.startDecommission(d);
+        dnManager.getDecomManager().startDecommission(d);
         d.setDecommissioned();
       }
-      assertEquals((double)load/3, fsn.getInServiceXceiverAverage(), EPSILON);
+      assertEquals((double)load/3, dnManager.getFSClusterStats()
+        .getInServiceXceiverAverage(), EPSILON);
 
       // update references of writer DN to update the de-commissioned state
       List<DatanodeDescriptor> liveNodes = new ArrayList<DatanodeDescriptor>();

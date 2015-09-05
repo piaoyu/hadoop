@@ -38,8 +38,10 @@ public class RamDiskReplicaLruTracker extends RamDiskReplicaTracker {
   private class RamDiskReplicaLru extends RamDiskReplica {
     long lastUsedTime;
 
-    private RamDiskReplicaLru(String bpid, long blockId, FsVolumeImpl ramDiskVolume) {
-      super(bpid, blockId, ramDiskVolume);
+    private RamDiskReplicaLru(String bpid, long blockId,
+                              FsVolumeImpl ramDiskVolume,
+                              long lockedBytesReserved) {
+      super(bpid, blockId, ramDiskVolume, lockedBytesReserved);
     }
 
     @Override
@@ -70,20 +72,23 @@ public class RamDiskReplicaLruTracker extends RamDiskReplicaTracker {
   TreeMultimap<Long, RamDiskReplicaLru> replicasPersisted;
 
   RamDiskReplicaLruTracker() {
-    replicaMaps = new HashMap<String, Map<Long, RamDiskReplicaLru>>();
-    replicasNotPersisted = new LinkedList<RamDiskReplicaLru>();
+    replicaMaps = new HashMap<>();
+    replicasNotPersisted = new LinkedList<>();
     replicasPersisted = TreeMultimap.create();
   }
 
   @Override
   synchronized void addReplica(final String bpid, final long blockId,
-                               final FsVolumeImpl transientVolume) {
+                               final FsVolumeImpl transientVolume,
+                               long lockedBytesReserved) {
     Map<Long, RamDiskReplicaLru> map = replicaMaps.get(bpid);
     if (map == null) {
-      map = new HashMap<Long, RamDiskReplicaLru>();
+      map = new HashMap<>();
       replicaMaps.put(bpid, map);
     }
-    RamDiskReplicaLru ramDiskReplicaLru = new RamDiskReplicaLru(bpid, blockId, transientVolume);
+    RamDiskReplicaLru ramDiskReplicaLru =
+        new RamDiskReplicaLru(bpid, blockId, transientVolume,
+                              lockedBytesReserved);
     map.put(blockId, ramDiskReplicaLru);
     replicasNotPersisted.add(ramDiskReplicaLru);
   }
@@ -168,9 +173,9 @@ public class RamDiskReplicaLruTracker extends RamDiskReplicaTracker {
 
   @Override
   synchronized RamDiskReplicaLru getNextCandidateForEviction() {
-    Iterator it = replicasPersisted.values().iterator();
+    final Iterator<RamDiskReplicaLru> it = replicasPersisted.values().iterator();
     while (it.hasNext()) {
-      RamDiskReplicaLru ramDiskReplicaLru = (RamDiskReplicaLru) it.next();
+      final RamDiskReplicaLru ramDiskReplicaLru = it.next();
       it.remove();
 
       Map<Long, RamDiskReplicaLru> replicaMap =

@@ -69,6 +69,7 @@ import javax.security.sasl.Sasl;
 import javax.security.sasl.SaslException;
 import javax.security.sasl.SaslServer;
 
+import org.apache.commons.io.Charsets;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.classification.InterfaceAudience;
@@ -116,10 +117,10 @@ import org.apache.hadoop.util.ProtoUtil;
 import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.Time;
-import org.htrace.Span;
-import org.htrace.Trace;
-import org.htrace.TraceInfo;
-import org.htrace.TraceScope;
+import org.apache.htrace.Span;
+import org.apache.htrace.Trace;
+import org.apache.htrace.TraceInfo;
+import org.apache.htrace.TraceScope;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.protobuf.ByteString;
@@ -182,7 +183,7 @@ public abstract class Server {
    * and send back a nicer response.
    */
   private static final ByteBuffer HTTP_GET_BYTES = ByteBuffer.wrap(
-      "GET ".getBytes());
+      "GET ".getBytes(Charsets.UTF_8));
   
   /**
    * An HTTP response to send back if we detect an HTTP request to our IPC
@@ -233,9 +234,11 @@ public abstract class Server {
       throw new IllegalArgumentException("ReRegistration of rpcKind: " +
           rpcKind);      
     }
-    LOG.debug("rpcKind=" + rpcKind + 
-        ", rpcRequestWrapperClass=" + rpcRequestWrapperClass + 
-        ", rpcInvoker=" + rpcInvoker);
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("rpcKind=" + rpcKind +
+          ", rpcRequestWrapperClass=" + rpcRequestWrapperClass +
+          ", rpcInvoker=" + rpcInvoker);
+    }
   }
   
   public Class<? extends Writable> getRpcRequestWrapper(
@@ -384,6 +387,62 @@ public abstract class Server {
   private Responder responder = null;
   private Handler[] handlers = null;
 
+  private boolean logSlowRPC = false;
+
+  /**
+   * Checks if LogSlowRPC is set true.
+   * @return
+   */
+  protected boolean isLogSlowRPC() {
+    return logSlowRPC;
+  }
+
+  /**
+   * Sets slow RPC flag.
+   * @param logSlowRPCFlag
+   */
+  @VisibleForTesting
+  protected void setLogSlowRPC(boolean logSlowRPCFlag) {
+    this.logSlowRPC = logSlowRPCFlag;
+  }
+
+
+  /**
+   * Logs a Slow RPC Request.
+   *
+   * @param methodName - RPC Request method name
+   * @param processingTime - Processing Time.
+   *
+   * if this request took too much time relative to other requests
+   * we consider that as a slow RPC. 3 is a magic number that comes
+   * from 3 sigma deviation. A very simple explanation can be found
+   * by searching for 68–95–99.7 rule. We flag an RPC as slow RPC
+   * if and only if it falls above 99.7% of requests. We start this logic
+   * only once we have enough sample size.
+   */
+  void logSlowRpcCalls(String methodName, int processingTime) {
+    final int deviation = 3;
+
+    // 1024 for minSampleSize just a guess -- not a number computed based on
+    // sample size analysis. It is chosen with the hope that this
+    // number is high enough to avoid spurious logging, yet useful
+    // in practice.
+    final int minSampleSize = 1024;
+    final double threeSigma = rpcMetrics.getProcessingMean() +
+        (rpcMetrics.getProcessingStdDev() * deviation);
+
+    if ((rpcMetrics.getProcessingSampleCount() > minSampleSize) &&
+        (processingTime > threeSigma)) {
+      if(LOG.isWarnEnabled()) {
+        String client = CurCall.get().connection.toString();
+        LOG.warn(
+            "Slow RPC : " + methodName + " took " + processingTime +
+                " milliseconds to process from client " + client);
+      }
+      rpcMetrics.incrSlowRpc();
+    }
+  }
+
   /**
    * A convenience method to bind to a given address and report 
    * better exceptions if the address is not a valid host.
@@ -498,6 +557,17 @@ public abstract class Server {
     // Create the next queue
     String prefix = getQueueClassPrefix();
     callQueue.swapQueue(getQueueClass(prefix, conf), maxQueueSize, prefix, conf);
+  }
+
+  /**
+   * Get from config if client backoff is enabled on that port.
+   */
+  static boolean getClientBackoffEnable(
+      String prefix, Configuration conf) {
+    String name = prefix + "." +
+        CommonConfigurationKeys.IPC_BACKOFF_ENABLE;
+    return conf.getBoolean(name,
+        CommonConfigurationKeys.IPC_BACKOFF_ENABLE_DEFAULT);
   }
 
   /** A call queued for handling. */
@@ -665,7 +735,8 @@ public abstract class Server {
         assert !running;
         readSelector.wakeup();
         try {
-          join();
+          super.interrupt();
+          super.join();
         } catch (InterruptedException ie) {
           Thread.currentThread().interrupt();
         }
@@ -748,6 +819,13 @@ public abstract class Server {
         
         Reader reader = getReader();
         Connection c = connectionManager.register(channel);
+        // If the connectionManager can't take it, close the connection.
+        if (c == null) {
+          if (channel.isOpen()) {
+            IOUtils.cleanup(null, channel);
+          }
+          continue;
+        }
         key.attach(c);  // so closeCurrentConnection can get the object
         reader.addConnection(c);
       }
@@ -1119,7 +1197,8 @@ public abstract class Server {
     private ByteBuffer data;
     private ByteBuffer dataLengthBuffer;
     private LinkedList<Call> responseQueue;
-    private volatile int rpcCount = 0; // number of outstanding rpcs
+    // number of outstanding rpcs
+    private AtomicInteger rpcCount = new AtomicInteger();
     private long lastContact;
     private int dataLength;
     private Socket socket;
@@ -1207,17 +1286,17 @@ public abstract class Server {
 
     /* Return true if the connection has no outstanding rpc */
     private boolean isIdle() {
-      return rpcCount == 0;
+      return rpcCount.get() == 0;
     }
     
     /* Decrement the outstanding RPC count */
     private void decRpcCount() {
-      rpcCount--;
+      rpcCount.decrementAndGet();
     }
     
     /* Increment the outstanding RPC count */
     private void incRpcCount() {
-      rpcCount++;
+      rpcCount.incrementAndGet();
     }
     
     private UserGroupInformation getAuthorizedUgi(String authorizedId)
@@ -1314,10 +1393,15 @@ public abstract class Server {
           saslResponse = processSaslMessage(saslMessage);
         } catch (IOException e) {
           rpcMetrics.incrAuthenticationFailures();
+          if (LOG.isDebugEnabled()) {
+            LOG.debug(StringUtils.stringifyException(e));
+          }
           // attempting user could be null
+          IOException tce = (IOException) getTrueCause(e);
           AUDITLOG.warn(AUTH_FAILED_FOR + this.toString() + ":"
-              + attemptingUser + " (" + e.getLocalizedMessage() + ")");
-          throw (IOException) getTrueCause(e);
+              + attemptingUser + " (" + e.getLocalizedMessage()
+              + ") with true cause: (" + tce.getLocalizedMessage() + ")");
+          throw tce;
         }
         
         if (saslServer != null && saslServer.isComplete()) {
@@ -1460,9 +1544,6 @@ public abstract class Server {
     }
     
     private void doSaslReply(Message message) throws IOException {
-      if (LOG.isDebugEnabled()) {
-        LOG.debug("Sending sasl message "+message);
-      }
       setupResponse(saslResponse, saslCall,
           RpcStatusProto.SUCCESS, null,
           new RpcResponseWrapper(message), null, null);
@@ -1708,7 +1789,7 @@ public abstract class Server {
     private void setupHttpRequestOnIpcPortResponse() throws IOException {
       Call fakeCall = new Call(0, RpcConstants.INVALID_RETRY_COUNT, null, this);
       fakeCall.setResponse(ByteBuffer.wrap(
-          RECEIVED_HTTP_REQ_RESPONSE.getBytes()));
+          RECEIVED_HTTP_REQ_RESPONSE.getBytes(Charsets.UTF_8)));
       responder.doRespond(fakeCall);
     }
 
@@ -1938,17 +2019,40 @@ public abstract class Server {
         // If the incoming RPC included tracing info, always continue the trace
         TraceInfo parentSpan = new TraceInfo(header.getTraceInfo().getTraceId(),
                                              header.getTraceInfo().getParentId());
-        traceSpan = Trace.startSpan(rpcRequest.toString(), parentSpan).detach();
+        traceSpan = Trace.startSpan(
+            RpcClientUtil.toTraceName(rpcRequest.toString()),
+            parentSpan).detach();
       }
 
       Call call = new Call(header.getCallId(), header.getRetryCount(),
           rpcRequest, this, ProtoUtil.convert(header.getRpcKind()),
           header.getClientId().toByteArray(), traceSpan);
 
-      callQueue.put(call);              // queue the call; maybe blocked here
+      if (callQueue.isClientBackoffEnabled()) {
+        // if RPC queue is full, we will ask the RPC client to back off by
+        // throwing RetriableException. Whether RPC client will honor
+        // RetriableException and retry depends on client ipc retry policy.
+        // For example, FailoverOnNetworkExceptionRetry handles
+        // RetriableException.
+        queueRequestOrAskClientToBackOff(call);
+      } else {
+        callQueue.put(call);              // queue the call; maybe blocked here
+      }
       incRpcCount();  // Increment the rpc count
     }
 
+    private void queueRequestOrAskClientToBackOff(Call call)
+        throws WrappedRpcServerException, InterruptedException {
+      // If rpc queue is full, we will ask the client to back off.
+      boolean isCallQueued = callQueue.offer(call);
+      if (!isCallQueued) {
+        rpcMetrics.incrClientBackoff();
+        RetriableException retriableException =
+            new RetriableException("Server is too busy.");
+        throw new WrappedRpcServerException(
+            RpcErrorCodeProto.ERROR_RPC_SERVER, retriableException);
+      }
+    }
 
     /**
      * Establish RPC connection setup by negotiating SASL if required, then
@@ -2068,9 +2172,9 @@ public abstract class Server {
         LOG.debug("Ignoring socket shutdown exception", e);
       }
       if (channel.isOpen()) {
-        try {channel.close();} catch(Exception e) {}
+        IOUtils.cleanup(null, channel);
       }
-      try {socket.close();} catch(Exception e) {}
+      IOUtils.cleanup(null, socket);
     }
   }
 
@@ -2107,6 +2211,7 @@ public abstract class Server {
           CurCall.set(call);
           if (call.traceSpan != null) {
             traceScope = Trace.continueSpan(call.traceSpan);
+            traceScope.getSpan().addTimelineAnnotation("called");
           }
 
           try {
@@ -2276,7 +2381,7 @@ public abstract class Server {
     // Setup appropriate callqueue
     final String prefix = getQueueClassPrefix();
     this.callQueue = new CallQueueManager<Call>(getQueueClass(prefix, conf),
-        maxQueueSize, prefix, conf);
+        getClientBackoffEnable(prefix, conf), maxQueueSize, prefix, conf);
 
     this.secretManager = (SecretManager<TokenIdentifier>) secretManager;
     this.authorize = 
@@ -2296,6 +2401,10 @@ public abstract class Server {
     this.tcpNoDelay = conf.getBoolean(
         CommonConfigurationKeysPublic.IPC_SERVER_TCPNODELAY_KEY,
         CommonConfigurationKeysPublic.IPC_SERVER_TCPNODELAY_DEFAULT);
+
+    this.setLogSlowRPC(conf.getBoolean(
+        CommonConfigurationKeysPublic.IPC_SERVER_LOG_SLOW_RPC,
+        CommonConfigurationKeysPublic.IPC_SERVER_LOG_SLOW_RPC_DEFAULT));
 
     // Create the responder here
     responder = new Responder();
@@ -2729,6 +2838,7 @@ public abstract class Server {
     final private int idleScanInterval;
     final private int maxIdleTime;
     final private int maxIdleToClose;
+    final private int maxConnections;
     
     ConnectionManager() {
       this.idleScanTimer = new Timer(
@@ -2745,6 +2855,9 @@ public abstract class Server {
       this.maxIdleToClose = conf.getInt(
           CommonConfigurationKeysPublic.IPC_CLIENT_KILL_MAX_KEY,
           CommonConfigurationKeysPublic.IPC_CLIENT_KILL_MAX_DEFAULT);
+      this.maxConnections = conf.getInt(
+          CommonConfigurationKeysPublic.IPC_SERVER_MAX_CONNECTIONS_KEY,
+          CommonConfigurationKeysPublic.IPC_SERVER_MAX_CONNECTIONS_DEFAULT);
       // create a set with concurrency -and- a thread-safe iterator, add 2
       // for listener and idle closer threads
       this.connections = Collections.newSetFromMap(
@@ -2772,11 +2885,19 @@ public abstract class Server {
       return count.get();
     }
 
+    boolean isFull() {
+      // The check is disabled when maxConnections <= 0.
+      return ((maxConnections > 0) && (size() >= maxConnections));
+    }
+
     Connection[] toArray() {
       return connections.toArray(new Connection[0]);
     }
 
     Connection register(SocketChannel channel) {
+      if (isFull()) {
+        return null;
+      }
       Connection connection = new Connection(channel, Time.now());
       add(connection);
       if (LOG.isDebugEnabled()) {
